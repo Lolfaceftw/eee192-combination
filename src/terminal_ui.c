@@ -307,88 +307,81 @@ bool ui_handle_raw_data_transmission(struct prog_state_type *ps,
     if (platform_usart_cdc_tx_busy()) {
         return false;
     }
-    
     if (ps->flags & PROG_FLAG_CDC_TX_BUSY) {
         return false;
     }
     
-    // Apply different formatting for GPS vs PM data
-    if (prefix && strncmp(prefix, "GPS", 3) == 0) {
-        // GPS data often has special formatting needs - use a dedicated buffer format
-        size_t formatted_len = 0;
-        
-        // Start with the header in green
-        formatted_len = snprintf(ps->cdc_tx_buf, CDC_TX_BUF_SZ, "\033[32m[%s] \033[0m", prefix);
-        
-        // For NMEA sentences (which should end with \r\n), replace them with explicit newline
-        // and ensure any control characters are displayed visibly
+    size_t formatted_len = 0;
+    // Ensure raw_data_str is not NULL if raw_data_len > 0
+    if (raw_data_len > 0 && !raw_data_str) {
+        return false; 
+    }
+
+    if (prefix && (strncmp(prefix, "GPS RAW BUFFER", 14) == 0 || strncmp(prefix, "GPS NMEA SENTENCE", 17) == 0)) {
+        formatted_len = snprintf(ps->cdc_tx_buf, CDC_TX_BUF_SZ, "[%s] ", prefix);
         for (size_t i = 0; i < raw_data_len && formatted_len < (CDC_TX_BUF_SZ - 10); i++) {
             char c = raw_data_str[i];
-            
-            // Special handling for control characters
-            if (c == '\r') {
-                // Skip \r for cleaner terminal display
-                continue;
+            if (c >= 32 && c <= 126) { // Printable ASCII
+                ps->cdc_tx_buf[formatted_len++] = c;
+            } else if (c == '\r') {
+                continue; // Skip CR
             } else if (c == '\n') {
-                // Add a real newline for terminal display
+                // Add newline and repeat prefix for context
                 formatted_len += snprintf(ps->cdc_tx_buf + formatted_len, 
                                          CDC_TX_BUF_SZ - formatted_len, 
-                                         "\r\n");
-            } else {
-                // Normal character
-                ps->cdc_tx_buf[formatted_len++] = c;
+                                         "\r\n[%s] ", prefix);
+            } else { // Non-printable ASCII
+                formatted_len += snprintf(ps->cdc_tx_buf + formatted_len,
+                                         CDC_TX_BUF_SZ - formatted_len,
+                                         "<%02X>", (unsigned char)c);
             }
         }
-        
-        // Ensure null termination
-        ps->cdc_tx_buf[formatted_len] = '\0';
-        
-        // Configure the transmission descriptor
-        ps->cdc_tx_desc[0].buf = ps->cdc_tx_buf;
-        ps->cdc_tx_desc[0].len = formatted_len;
+    } else if (prefix && strncmp(prefix, "PM RAW HEX", 10) == 0) {
+        formatted_len = snprintf(ps->cdc_tx_buf, CDC_TX_BUF_SZ, "[PM RAW HEX] ");
+        for (size_t i = 0; i < raw_data_len && formatted_len < (CDC_TX_BUF_SZ - 4); i++) { // 3 chars for hex + space, 1 for null
+            formatted_len += snprintf(ps->cdc_tx_buf + formatted_len,
+                                     CDC_TX_BUF_SZ - formatted_len,
+                                     "%02X ", (unsigned char)raw_data_str[i]);
+            if ((i + 1) % 16 == 0 && i < raw_data_len - 1 && formatted_len < (CDC_TX_BUF_SZ - 15)) { // Space for prefix + newline
+                formatted_len += snprintf(ps->cdc_tx_buf + formatted_len,
+                                         CDC_TX_BUF_SZ - formatted_len,
+                                         "\r\n[PM RAW HEX] ");
+            }
+        }
     } else {
-        // Standard handling for other raw data types
-        // Calculate the total needed length with prefix
-        size_t prefix_len = (prefix) ? strlen(prefix) + 2 : 0; // +2 for ": "
-        size_t total_len = prefix_len + raw_data_len;
-        
-        // Ensure the data will fit in the buffer
-        if (total_len >= CDC_TX_BUF_SZ) {
-            // Truncate if necessary
-            raw_data_len = CDC_TX_BUF_SZ - prefix_len - 1;
-            total_len = prefix_len + raw_data_len;
+        // Generic prefix handling (less common now)
+        if (prefix) {
+            formatted_len = snprintf(ps->cdc_tx_buf, CDC_TX_BUF_SZ, "[%s] ", prefix);
         }
-        
-        // Copy data to the buffer, with prefix if provided
-        if (prefix && prefix_len > 0) {
-            snprintf(ps->cdc_tx_buf, CDC_TX_BUF_SZ, "\033[33m[%s] \033[0m", prefix);
-            memcpy(ps->cdc_tx_buf + prefix_len, raw_data_str, raw_data_len);
-        } else {
-            memcpy(ps->cdc_tx_buf, raw_data_str, raw_data_len);
+        for (size_t i = 0; i < raw_data_len && formatted_len < (CDC_TX_BUF_SZ - 10); i++) {
+             char c = raw_data_str[i];
+            if (c >= 32 && c <= 126) { ps->cdc_tx_buf[formatted_len++] = c; }
+            else if (c == '\r') { continue; }
+            else if (c == '\n') { formatted_len += snprintf(ps->cdc_tx_buf + formatted_len, CDC_TX_BUF_SZ - formatted_len, "\r\n"); }
+            else { formatted_len += snprintf(ps->cdc_tx_buf + formatted_len, CDC_TX_BUF_SZ - formatted_len, "<%02X>", (unsigned char)c); }
         }
-        
-        // Add a trailing newline if there isn't one already
-        if (raw_data_len > 0 && ps->cdc_tx_buf[total_len-2] != '\r' && ps->cdc_tx_buf[total_len-1] != '\n') {
-            ps->cdc_tx_buf[total_len++] = '\r';
-            ps->cdc_tx_buf[total_len++] = '\n';
-        }
-        
-        // Ensure null termination
-        ps->cdc_tx_buf[total_len] = '\0';
-        
-        // Configure the transmission descriptor
-        ps->cdc_tx_desc[0].buf = ps->cdc_tx_buf;
-        ps->cdc_tx_desc[0].len = total_len;
     }
-    
+
+    // Ensure final newline if content exists and buffer has space
+    if (formatted_len > 0 && formatted_len < (CDC_TX_BUF_SZ - 2)) {
+        if (formatted_len < 2 || ps->cdc_tx_buf[formatted_len-2] != '\r' || ps->cdc_tx_buf[formatted_len-1] != '\n') {
+            ps->cdc_tx_buf[formatted_len++] = '\r';
+            ps->cdc_tx_buf[formatted_len++] = '\n';
+        }
+    }
+    ps->cdc_tx_buf[formatted_len] = '\0'; // Null-terminate
+
+    if (formatted_len == 0) return false; // Nothing to send
+
+    ps->cdc_tx_desc[0].buf = ps->cdc_tx_buf;
+    ps->cdc_tx_desc[0].len = formatted_len;
     ps->flags |= PROG_FLAG_CDC_TX_BUSY;
     
-    // Attempt to send the raw data
     if (platform_usart_cdc_tx_async(ps->cdc_tx_desc, 1)) {
         ps->flags &= ~PROG_FLAG_CDC_TX_BUSY;
         return true;
     } else {
-        // Keep TX busy flag set for retry
+        // Flag remains set; watchdog in main.c should eventually clear it if TX hangs
         return false;
     }
 } 

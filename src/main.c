@@ -15,38 +15,165 @@
 #include "../inc/terminal_ui.h" // Terminal UI for displaying data
 #include <stdint.h> // Add this for uint16_t definition
 
+// If NMEA_MAX_SENTENCE_LEN is not defined in nmea_parser.h, define a reasonable default here.
+// Ideally, this should be in nmea_parser.h or a shared configuration header.
+#ifndef NMEA_MAX_SENTENCE_LEN
+#define NMEA_MAX_SENTENCE_LEN 128 // A common NMEA sentence is ~82 chars, 128 provides buffer.
+#endif
+
 // Global application state variable
 static prog_state_t app_state;
 
 // Configuration constants (can be moved to main.h or a config.h)
-#define DEBUG_MODE_RAW_GPS      0 // 1 to print raw GPS sentences, 0 to disable
-#define DEBUG_MODE_RAW_PM       0 // 1 to print raw PM hex data, 0 to disable
-#define PMS_DEBUG_MODE          0 // Enables PMS parser internal debug messages via debug_printf
+#define DEBUG_MODE_RAW_GPS      1 // 1 to print raw GPS sentences, 0 to disable
+#define DEBUG_MODE_RAW_PM       1 // 1 to print raw PM hex data, 0 to disable
+#define PMS_DEBUG_MODE          1 // Enables PMS parser internal debug messages via debug_printf
+
+// Add LED blinking define constants
+#define LED_BLINK_ON_GPS_DATA   1 // Blink LED when GPS data is received
+#define LED_BLINK_ON_PM_DATA    1 // Blink LED when PM data is received and parsed
+#define LED_BLINK_DURATION_MS   50 // How long to blink the LED in milliseconds
+
+// Define constants for PM data accumulation
+#define PM_BUFFER_ACCUMULATE    1 // Set to 1 to accumulate PM data into a buffer
+#define PM_ACCUMULATE_THRESHOLD 32 // Increased to typical PMS5003 packet size
+#define PM_FORCE_RAW_GPS        1  // Force display of raw GPS data regardless of debug setting
+
+// PM data accumulation buffer
+static uint8_t pm_accumulate_buffer[PM_RX_BUF_SZ * 2]; // Double size buffer to allow accumulation
+static uint16_t pm_accumulate_len = 0;
+static platform_timespec_t pm_last_receive_time = {0, 0};
+static const uint32_t PM_ACCUMULATE_TIMEOUT_MS = 300; // Slightly increased timeout for accumulated buffer
+
+// LED blinking control variables - moved to module level to be accessible from all functions
+static uint32_t led_blink_start_ms = 0;
+static bool led_is_blinking = false;
 
 /**
- * @brief Basic debug print function.
- * Required by pms_parser.c if PMS_DEBUG_MODE is enabled.
- * Sends formatted string to CDC terminal.
- * TODO: Implement robustly, handle potential buffer overflows if vsnprintf is used.
+ * @brief Basic debug print function - MODIFIED FOR SAFER CDC ACCESS.
+ * Sends formatted string to CDC terminal if not busy.
+ * MUST be passed the app_state pointer.
  */
-void debug_printf(const char *fmt, ...) {
-#if PMS_DEBUG_MODE || DEBUG_MODE_RAW_GPS || DEBUG_MODE_RAW_PM // Only compile if any debug mode needs it
-    if (platform_usart_cdc_tx_busy()) {
-        return; // Don't block or queue if busy, simple approach
+void debug_printf(prog_state_t *ps, const char *fmt, ...) {
+    // If CDC is busy with another transmission, skip this debug message to avoid conflict
+    if (platform_usart_cdc_tx_busy() || (ps->flags & PROG_FLAG_CDC_TX_BUSY)) {
+        return;
     }
+    
+    // Use a local static buffer for initial formatting to avoid ps->cdc_tx_buf if it's in use by a multi-part message elsewhere
+    static char local_debug_format_buf[256]; 
+    char final_debug_msg_buf[280]; // Buffer for "[DEBUG] " prefix + message + \r\n\0
 
-    char buffer[128]; // Reasonably sized buffer for debug messages
     va_list args;
     va_start(args, fmt);
-    vsnprintf(buffer, sizeof(buffer), fmt, args);
+    int len = vsnprintf(local_debug_format_buf, sizeof(local_debug_format_buf), fmt, args);
     va_end(args);
+    
+    if (len <= 0 || len >= sizeof(local_debug_format_buf)) {
+        return; // Formatting error or overflow
+    }
 
-    app_state.cdc_tx_desc[0].buf = buffer;
-    app_state.cdc_tx_desc[0].len = strlen(buffer);
-    platform_usart_cdc_tx_async(app_state.cdc_tx_desc, 1);
-#else
-    (void)fmt; // Suppress unused parameter warning
-#endif
+    // Prepend "[DEBUG] " and append \r\n
+    // Ensure the message ends with a newline for proper terminal display
+    // Check if the last char is already a newline, and second to last is carriage return
+    bool ends_with_crlf = (len >= 2 && local_debug_format_buf[len-2] == '\r' && local_debug_format_buf[len-1] == '\n');
+    bool ends_with_lf = (!ends_with_crlf && len >=1 && local_debug_format_buf[len-1] == '\n');
+
+    if (ends_with_crlf) {
+         snprintf(final_debug_msg_buf, sizeof(final_debug_msg_buf), "[DEBUG] %s", local_debug_format_buf);
+    } else if (ends_with_lf) {
+         // Replace just LF with CRLF for consistency
+        local_debug_format_buf[len-1] = '\0'; // effectively truncate LF
+        snprintf(final_debug_msg_buf, sizeof(final_debug_msg_buf), "[DEBUG] %s\r\n", local_debug_format_buf);
+    } else {
+        snprintf(final_debug_msg_buf, sizeof(final_debug_msg_buf), "[DEBUG] %s\r\n", local_debug_format_buf);
+    }
+    
+    // Update len to the new length of final_debug_msg_buf
+    len = strlen(final_debug_msg_buf);
+    if (len == 0 || len >= sizeof(ps->cdc_tx_buf)) { // Check against the destination buffer
+        // Message too long for ps->cdc_tx_buf or empty, should not happen with reasonable fmt
+        return; 
+    }
+
+    // Safely copy to the shared CDC TX buffer
+    memcpy(ps->cdc_tx_buf, final_debug_msg_buf, len + 1); // +1 for null terminator
+    
+    // Configure transmission descriptor using app_state's descriptor
+    ps->cdc_tx_desc[0].buf = ps->cdc_tx_buf; // Point to the message in app_state's buffer
+    ps->cdc_tx_desc[0].len = len;
+    
+    // Set busy flag and attempt transmission
+    ps->flags |= PROG_FLAG_CDC_TX_BUSY;
+    if (platform_usart_cdc_tx_async(&ps->cdc_tx_desc[0], 1)) {
+        ps->flags &= ~PROG_FLAG_CDC_TX_BUSY; // Clear busy flag on success
+    } else {
+        // Transmission failed to start, flag remains set. Watchdog should handle if it gets stuck.
+    }
+}
+
+// Add helper function to check timeouts
+static bool is_timeout_elapsed(const platform_timespec_t *current_time, 
+                              const platform_timespec_t *last_time, 
+                              uint32_t timeout_ms) {
+    platform_timespec_t delta;
+    platform_tick_delta(&delta, current_time, last_time);
+    
+    // Convert delta to milliseconds
+    uint32_t delta_ms = delta.nr_sec * 1000 + delta.nr_nsec / 1000000;
+    
+    return delta_ms >= timeout_ms;
+}
+
+// Add helper function to process accumulated PM data
+static void process_accumulated_pm_data(struct prog_state_type *ps) {
+    if (pm_accumulate_len == 0) {
+        return; // Nothing to process
+    }
+    
+    debug_printf(ps, "PM: Processing accumulated %u bytes", pm_accumulate_len);
+    
+    bool valid_pm_header = false;
+    if (pm_accumulate_len >= 2 && pm_accumulate_buffer[0] == 0x42 && pm_accumulate_buffer[1] == 0x4D) {
+        valid_pm_header = true;
+        debug_printf(ps, "PM: Valid header 0x424D found.");
+    }
+
+    if (DEBUG_MODE_RAW_PM) { 
+        debug_printf(ps, "PM: Preparing to print RAW HEX (%u bytes). CDC Busy_HW: %d, CDC_Busy_Flag: %d", 
+            pm_accumulate_len, platform_usart_cdc_tx_busy(), (ps->flags & PROG_FLAG_CDC_TX_BUSY) ? 1:0);
+        // Explicitly clear the software busy flag before attempting to send raw PM data
+        ps->flags &= ~PROG_FLAG_CDC_TX_BUSY; 
+        ui_handle_raw_data_transmission(ps, "PM RAW HEX", (const char*)pm_accumulate_buffer, pm_accumulate_len);
+    }
+    
+    // Feed to parser regardless of valid_pm_header for now, parser should reject if invalid
+    for (uint16_t i = 0; i < pm_accumulate_len; ++i) {
+        pms_parser_status_t status = pms_parser_feed_byte(ps, 
+                                                         &ps->pms_parser_state, 
+                                                         pm_accumulate_buffer[i],
+                                                         &ps->latest_pms_data);
+        if (status == PMS_PARSER_OK) {
+            ps->flags |= PROG_FLAG_PM_DATA_PARSED;
+            debug_printf(ps, "PM: Parsed OK: PM1.0=%u, PM2.5=%u, PM10=%u", 
+                        ps->latest_pms_data.pm1_0_atm,
+                        ps->latest_pms_data.pm2_5_atm,
+                        ps->latest_pms_data.pm10_atm);
+            #if LED_BLINK_ON_PM_DATA
+            platform_gpo_modify(PLATFORM_GPO_LED_ONBOARD, 0);
+            platform_timespec_t current_time;
+            platform_tick_count(&current_time);
+            uint32_t current_time_ms = current_time.nr_sec * 1000 + current_time.nr_nsec / 1000000;
+            led_blink_start_ms = current_time_ms;
+            led_is_blinking = true;
+            #endif
+            // Don't break here; let parser consume as much of the buffer as possible
+            // if multiple packets were somehow accumulated (though threshold should limit this)
+        }
+    }
+    
+    pm_accumulate_len = 0;
+    memset(pm_accumulate_buffer, 0, sizeof(pm_accumulate_buffer));
 }
 
 /**
@@ -58,12 +185,16 @@ static void prog_setup(void) {
 
     // Initialize hardware platform (clocks, GPIOs, SysTick, USARTs via platform_init)
     platform_init(); // This now inits SERCOM0, SERCOM1, and SERCOM3
+    
+    // Initial LED blink to show we're alive
+    platform_gpo_modify(PLATFORM_GPO_LED_ONBOARD, 0);
+    
+    // Debug message to show we've started
+    debug_printf(&app_state, "Combined GPS and PM sensor project starting up...");
 
     // Initialize PMS parser state
     pms_parser_init(&app_state.pms_parser_state);
-
-    // Initialize NMEA parser state (if any specific init is needed - nmea_parse_gpgll_and_format is typically called directly)
-    // nmea_parser_init(); 
+    debug_printf(&app_state, "PMS parser initialized");
 
     // Initialize display timing parameters
     app_state.display_interval_ms = 200; // Display combined data five times per second (200ms) for testing
@@ -71,13 +202,16 @@ static void prog_setup(void) {
     
     // Enable debug mode by default
     app_state.is_debug = true;
+    debug_printf(&app_state, "Debug mode enabled");
 
     // Setup asynchronous reception for GPS (SERCOM1)
     app_state.gps_rx_desc.buf = app_state.gps_rx_buf;
     app_state.gps_rx_desc.max_len = GPS_RX_BUF_SZ;
     // Use the correct function name from gps_usart.c (likely gps_platform_usart_cdc_rx_async)
     if (!gps_platform_usart_cdc_rx_async(&app_state.gps_rx_desc)) {
-        // Handle error: GPS RX setup failed
+        debug_printf(&app_state, "ERROR: GPS RX setup failed!");
+    } else {
+        debug_printf(&app_state, "GPS RX setup successful");
     }
 
     // Setup asynchronous reception for PM Sensor (SERCOM0)
@@ -85,18 +219,27 @@ static void prog_setup(void) {
     app_state.pm_rx_desc.max_len = PM_RX_BUF_SZ;
     // Use the correct function name from pm_usart.c (likely pm_platform_usart_cdc_rx_async)
     if (!pm_platform_usart_cdc_rx_async(&app_state.pm_rx_desc)) {
-        // Handle error: PM RX setup failed
+        debug_printf(&app_state, "ERROR: PM RX setup failed!");
+    } else {
+        debug_printf(&app_state, "PM RX setup successful");
     }
 
     // Setup asynchronous reception for CDC Terminal (SERCOM3) - if console input is needed
     app_state.cdc_rx_desc.buf = app_state.cdc_rx_buf;
     app_state.cdc_rx_desc.max_len = CDC_RX_BUF_SZ;
     if (!platform_usart_cdc_rx_async(&app_state.cdc_rx_desc)) {
-        // Handle error: CDC RX setup failed
+        debug_printf(&app_state, "ERROR: CDC RX setup failed!");
+    } else {
+        debug_printf(&app_state, "CDC RX setup successful");
     }
 
     // Request initial banner display
     app_state.flags |= PROG_FLAG_BANNER_PENDING;
+    
+    // Turn off LED after initialization
+    platform_gpo_modify(0, PLATFORM_GPO_LED_ONBOARD);
+    
+    debug_printf(&app_state, "Initialization complete, entering main loop");
 }
 
 /**
@@ -141,13 +284,41 @@ static void prog_loop_one(void) {
     
     platform_do_loop_one(); // Handles USART ticks, button checks (via platform layer)
 
-    // Get current time for watchdog
+    // Get current time for watchdog and other timing
     platform_tick_count(&current_time);
+    uint32_t current_time_ms = current_time.nr_sec * 1000 + current_time.nr_nsec / 1000000;
+
+    // --- Check if accumulated PM data should be processed due to timeout ---
+    #if PM_BUFFER_ACCUMULATE
+    if (pm_accumulate_len > 0 && is_timeout_elapsed(&current_time, &pm_last_receive_time, PM_ACCUMULATE_TIMEOUT_MS)) {
+        debug_printf(&app_state, "PM: Accumulation timeout, processing %u bytes", pm_accumulate_len);
+        process_accumulated_pm_data(&app_state);
+    }
+    #endif
+
+    // --- Handle LED blinking timing ---
+    // Handle LED blinking timing if LED is currently blinking
+    if (led_is_blinking) {
+        if (current_time_ms - led_blink_start_ms >= LED_BLINK_DURATION_MS) {
+            // Turn off LED after blink duration
+            platform_gpo_modify(0, PLATFORM_GPO_LED_ONBOARD);
+            led_is_blinking = false;
+            debug_printf(&app_state, "LED blink complete");
+        }
+    }
 
     app_state.button_event = platform_pb_get_event();
     if (app_state.button_event & PLATFORM_PB_ONBOARD_PRESS) {
         app_state.flags |= PROG_FLAG_BANNER_PENDING; // Re-trigger banner on button press
         last_active_time_sec = current_time.nr_sec; // Update activity timestamp
+        
+        // Display debug message when button is pressed
+        debug_printf(&app_state, "Button pressed - displaying banner");
+        
+        // Blink LED in response to button press
+        platform_gpo_modify(PLATFORM_GPO_LED_ONBOARD, 0);
+        led_blink_start_ms = current_time_ms;
+        led_is_blinking = true;
     }
 
     // Display banner if pending
@@ -155,69 +326,129 @@ static void prog_loop_one(void) {
 
     // --- GPS Data Handling ---
     if (app_state.gps_rx_desc.compl_type == PLATFORM_USART_RX_COMPL_DATA) {
+        debug_printf(&app_state, "GPS: RX_COMPL_DATA detected, len: %u", app_state.gps_rx_desc.compl_info.data_len);
         app_state.flags |= PROG_FLAG_GPS_DATA_RECEIVED;
-        last_active_time_sec = current_time.nr_sec; // Update activity timestamp
+        last_active_time_sec = current_time.nr_sec;
+        debug_printf(&app_state, "GPS: Received %u bytes", app_state.gps_rx_desc.compl_info.data_len);
         
-        // Enable raw GPS data display
-        #define DEBUG_MODE_RAW_GPS 1
+        #if LED_BLINK_ON_GPS_DATA
+        platform_gpo_modify(PLATFORM_GPO_LED_ONBOARD, 0);
+        led_blink_start_ms = current_time_ms;
+        led_is_blinking = true;
+        #endif
         
-        // Append received data to assembly buffer, checking for overflow
         if ((app_state.gps_assembly_len + app_state.gps_rx_desc.compl_info.data_len) < GPS_ASSEMBLY_BUF_SZ) {
             memcpy(&app_state.gps_assembly_buf[app_state.gps_assembly_len],
                    app_state.gps_rx_buf,
                    app_state.gps_rx_desc.compl_info.data_len);
             app_state.gps_assembly_len += app_state.gps_rx_desc.compl_info.data_len;
-            app_state.gps_assembly_buf[app_state.gps_assembly_len] = '\0'; // Null-terminate
+            app_state.gps_assembly_buf[app_state.gps_assembly_len] = '\0'; 
+
+            // Display raw GPS buffer for debugging if enabled or forced
+            if (DEBUG_MODE_RAW_GPS || PM_FORCE_RAW_GPS) {
+                if (app_state.gps_assembly_len > 0) {
+                    debug_printf(&app_state, "GPS: Preparing to print RAW BUFFER (%u bytes). CDC Busy_HW: %d, CDC_Busy_Flag: %d", 
+                        app_state.gps_assembly_len, platform_usart_cdc_tx_busy(), (app_state.flags & PROG_FLAG_CDC_TX_BUSY) ? 1:0);
+                    // Explicitly clear the software busy flag before raw GPS buffer print
+                    app_state.flags &= ~PROG_FLAG_CDC_TX_BUSY;
+                    ui_handle_raw_data_transmission(&app_state, "GPS RAW BUFFER", app_state.gps_assembly_buf, app_state.gps_assembly_len);
+                }
+            }
+        } else {
+            debug_printf(&app_state, "GPS: Assembly buffer overflow, discarding %u bytes", app_state.gps_rx_desc.compl_info.data_len);
+            // Optionally clear gps_assembly_buf or handle error
         }
         
-        // Extract and process NMEA sentences
-        char sentence[GPS_RX_BUF_SZ];
-        while (extract_nmea_sentence(app_state.gps_assembly_buf, &app_state.gps_assembly_len, sentence, sizeof(sentence))) {
-            // Debug print of raw NMEA if enabled
-            if (DEBUG_MODE_RAW_GPS) {
-                ui_handle_raw_data_transmission(&app_state, "GPS RAW", sentence, strlen(sentence));
-            }
-            
-            // Check if it's a GPGLL sentence and parse it
-            if (strncmp(sentence, "$GPGLL", 6) == 0) {
-                // Clear parsed fields
-                app_state.parsed_gps_time[0] = '\0';
-                app_state.parsed_gps_lat[0] = '\0';
-                app_state.parsed_gps_lon[0] = '\0';
-                
-                // Create a temporary buffer to hold the formatted output
-                char temp_buffer[256];
-                
-                // Parse the GPGLL sentence using the correct function signature
-                if (nmea_parse_gpgll_and_format(sentence, temp_buffer, sizeof(temp_buffer))) {
-                    // Parse the result into separate fields if needed
-                    // For now just use placeholder values
-                    strncpy(app_state.parsed_gps_time, "00:00:00", sizeof(app_state.parsed_gps_time));
-                    strncpy(app_state.parsed_gps_lat, "0.0000N", sizeof(app_state.parsed_gps_lat));
-                    strncpy(app_state.parsed_gps_lon, "0.0000E", sizeof(app_state.parsed_gps_lon));
+        // Attempt to extract and process NMEA sentences
+        uint16_t processed_len_in_assembly = 0;
+        while(processed_len_in_assembly < app_state.gps_assembly_len) {
+            char nmea_sentence_buffer[NMEA_MAX_SENTENCE_LEN];
+            uint16_t sentence_len = extract_nmea_sentence(
+                app_state.gps_assembly_buf + processed_len_in_assembly, 
+                &(app_state.gps_assembly_len),
+                nmea_sentence_buffer, 
+                NMEA_MAX_SENTENCE_LEN
+            );
+
+            if (sentence_len > 0) {
+                // Successfully extracted a sentence
+                if (DEBUG_MODE_RAW_GPS || PM_FORCE_RAW_GPS) {
+                    debug_printf(&app_state, "GPS: Extracted NMEA sentence, len %u. Preparing for raw print. CDC Busy_HW: %d, CDC_Busy_Flag: %d",
+                        sentence_len, platform_usart_cdc_tx_busy(), (app_state.flags & PROG_FLAG_CDC_TX_BUSY) ? 1:0);
+                    // Explicitly clear the software busy flag before raw NMEA sentence print
+                    app_state.flags &= ~PROG_FLAG_CDC_TX_BUSY;
+                    ui_handle_raw_data_transmission(&app_state, "GPS NMEA SENTENCE", nmea_sentence_buffer, sentence_len);
+                }
+
+                // Parse the GPGLL sentence
+                if (strncmp(nmea_sentence_buffer, "$GPGLL", 6) == 0) {
+                    debug_printf(&app_state, "GPGLL sentence found: %s", nmea_sentence_buffer);
                     
-                    app_state.flags |= PROG_FLAG_GPGLL_DATA_PARSED;
+                    // Clear parsed fields
+                    app_state.parsed_gps_time[0] = '\0';
+                    app_state.parsed_gps_lat[0] = '\0';
+                    app_state.parsed_gps_lon[0] = '\0';
+                    
+                    // Create a temporary buffer to hold the formatted output
+                    char temp_buffer[256];
+                    
+                    // Parse the GPGLL sentence using the correct function signature
+                    if (nmea_parse_gpgll_and_format(nmea_sentence_buffer, temp_buffer, sizeof(temp_buffer))) {
+                        debug_printf(&app_state, "GPGLL parsed successfully: %s", temp_buffer);
+                        
+                        // Parse the result into separate fields
+                        // For demonstration purposes - parse temp_buffer to extract fields
+                        // You would typically parse the NMEA sentence directly in a real implementation
+                        strncpy(app_state.parsed_gps_time, "00:00:00", sizeof(app_state.parsed_gps_time));
+                        strncpy(app_state.parsed_gps_lat, "0.0000N", sizeof(app_state.parsed_gps_lat));
+                        strncpy(app_state.parsed_gps_lon, "0.0000E", sizeof(app_state.parsed_gps_lon));
+                        
+                        app_state.flags |= PROG_FLAG_GPGLL_DATA_PARSED;
+                    } else {
+                        debug_printf(&app_state, "Failed to parse GPGLL sentence");
+                    }
                 }
             }
         }
 
-        // Re-arm GPS RX
-        app_state.gps_rx_desc.compl_type = PLATFORM_USART_RX_COMPL_NONE;
         if (!gps_platform_usart_cdc_rx_async(&app_state.gps_rx_desc)) {
-            // Handle error
+            debug_printf(&app_state, "GPS: ERROR Failed to re-arm RX");
         }
     }
 
     // --- PM Sensor Data Handling ---
     if (app_state.pm_rx_desc.compl_type == PLATFORM_USART_RX_COMPL_DATA) {
-        app_state.flags |= PROG_FLAG_PM_DATA_RECEIVED;
-        last_active_time_sec = current_time.nr_sec; // Update activity timestamp
+        // This debug line is the source of "PM data received: 1 bytes"
+        // It's accurate for the *hardware reception event* if data arrives byte-by-byte.
+        // Consider removing or reducing its verbosity if too noisy.
+        // debug_printf(&app_state, "PM: HW Received %u bytes", app_state.pm_rx_desc.compl_info.data_len); 
         
-        // Define a minimum meaningful packet length for PM data to display (typical PMS data frame is 32 bytes)
-        #define PM_MIN_DISPLAY_LENGTH 8
-        
-        // Enable raw PM data display
-        #define DEBUG_MODE_RAW_PM 1
+        #if PM_BUFFER_ACCUMULATE
+        platform_tick_count(&current_time); // Update current time for timeout logic
+        pm_last_receive_time = current_time;
+        if (pm_accumulate_len + app_state.pm_rx_desc.compl_info.data_len < sizeof(pm_accumulate_buffer)) {
+            memcpy(pm_accumulate_buffer + pm_accumulate_len, 
+                   app_state.pm_rx_buf, 
+                   app_state.pm_rx_desc.compl_info.data_len);
+            pm_accumulate_len += app_state.pm_rx_desc.compl_info.data_len;
+            if (pm_accumulate_len >= PM_ACCUMULATE_THRESHOLD) {
+                process_accumulated_pm_data(&app_state);
+            }
+        } else {
+            debug_printf(&app_state, "PM: Accumulation buffer full (%u + %u), processing then adding.", pm_accumulate_len, app_state.pm_rx_desc.compl_info.data_len);
+            process_accumulated_pm_data(&app_state); // Process what's there
+            if (app_state.pm_rx_desc.compl_info.data_len < sizeof(pm_accumulate_buffer)) { // Ensure new data fits
+                memcpy(pm_accumulate_buffer, app_state.pm_rx_buf, app_state.pm_rx_desc.compl_info.data_len);
+                pm_accumulate_len = app_state.pm_rx_desc.compl_info.data_len;
+            } else {
+                 debug_printf(&app_state, "PM: ERROR - incoming packet too large for empty buffer (%u bytes)", app_state.pm_rx_desc.compl_info.data_len);
+                 pm_accumulate_len = 0; // discard
+            }
+        }
+        #else
+        // Original single-reception handling
+        // Define a minimum meaningful packet length for PM data to display 
+        #define PM_MIN_DISPLAY_LENGTH 2
         
         // Debug print of raw PM data as complete packet only if received enough data
         if (DEBUG_MODE_RAW_PM && app_state.pm_rx_desc.compl_info.data_len >= PM_MIN_DISPLAY_LENGTH) {
@@ -257,23 +488,32 @@ static void prog_loop_one(void) {
         // Feed received bytes to the PMS parser
         for (uint16_t i = 0; i < app_state.pm_rx_desc.compl_info.data_len; ++i) {
             pms_parser_status_t status = pms_parser_feed_byte(&app_state, 
-                                                             &app_state.pms_parser_state, 
-                                                             app_state.pm_rx_buf[i],
-                                                             &app_state.latest_pms_data);
+                                                            &app_state.pms_parser_state, 
+                                                            app_state.pm_rx_buf[i],
+                                                            &app_state.latest_pms_data);
             if (status == PMS_PARSER_OK) {
                 app_state.flags |= PROG_FLAG_PM_DATA_PARSED;
                 
-                if (PMS_DEBUG_MODE) {
-                    debug_printf("PMS Parsed OK! PM2.5: %u\r\n", app_state.latest_pms_data.pm2_5_atm);
-                }
+                // Debug message for PM data parsed successfully
+                debug_printf(&app_state, "PM data parsed: PM1.0=%u, PM2.5=%u, PM10=%u ug/m3", 
+                            app_state.latest_pms_data.pm1_0_atm,
+                            app_state.latest_pms_data.pm2_5_atm,
+                            app_state.latest_pms_data.pm10_atm);
+                
+                // Blink LED when PM data is successfully parsed
+                #if LED_BLINK_ON_PM_DATA
+                platform_gpo_modify(PLATFORM_GPO_LED_ONBOARD, 0);
+                led_blink_start_ms = current_time_ms;
+                led_is_blinking = true;
+                #endif
+                
                 break; // Processed one full packet
             }
         }
+        #endif
         
-        // Re-arm PM RX
-        app_state.pm_rx_desc.compl_type = PLATFORM_USART_RX_COMPL_NONE;
         if (!pm_platform_usart_cdc_rx_async(&app_state.pm_rx_desc)) {
-            // Handle error
+            debug_printf(&app_state, "PM: ERROR Failed to re-arm RX");
         }
     }
 
@@ -342,17 +582,21 @@ static void prog_loop_one(void) {
     
     // Watchdog for flag deadlocks - If no activity for 5 seconds, clear potential stuck flags
     if (current_time.nr_sec - last_active_time_sec > 5) {
+        debug_printf(&app_state, "Watchdog: Clearing potentially stuck flags after 5 seconds of inactivity");
+        
         // Clear potentially stuck flags
         app_state.flags &= ~PROG_FLAG_CDC_TX_BUSY;
         
         // Re-arm both receivers if they seem stuck
         if (gps_platform_usart_cdc_rx_busy()) {
+            debug_printf(&app_state, "Watchdog: GPS RX appears stuck, re-arming");
             gps_platform_usart_cdc_rx_abort();
             app_state.gps_rx_desc.compl_type = PLATFORM_USART_RX_COMPL_NONE;
             gps_platform_usart_cdc_rx_async(&app_state.gps_rx_desc);
         }
         
         if (pm_platform_usart_cdc_rx_busy()) {
+            debug_printf(&app_state, "Watchdog: PM RX appears stuck, re-arming");
             pm_platform_usart_cdc_rx_abort();
             app_state.pm_rx_desc.compl_type = PLATFORM_USART_RX_COMPL_NONE;
             pm_platform_usart_cdc_rx_async(&app_state.pm_rx_desc);

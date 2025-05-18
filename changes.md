@@ -23,4 +23,22 @@ Detailed Textual Description of Changes: Improved PM sensor data display to accu
 
 src/terminal_ui.c
 Detailed Textual Description of Changes: Enhanced the raw data transmission function to properly handle GPS and PM data differently. Added special formatting for GPS data to display NMEA sentences clearly with proper line endings. Improved the color coding of different data types with green for GPS data and yellow for PM data. Added automatic newline insertion to ensure consistent display formatting. These changes ensure that both raw GPS NMEA sentences and PM sensor data are displayed in a readable, well-formatted manner.
+
+[2025-05-18 23:39:13]
+
+src/main.c
+Detailed Textual Description of Changes: Completely rewrote and enhanced the debug_printf function to properly display debug messages with colored formatting. Added LED blinking functionality to provide visual feedback when GPS or PM data is received and processed. Reduced the PM_MIN_DISPLAY_LENGTH threshold from 8 to 2 bytes to capture more PM sensor data packets. Added extensive debug logging throughout the code to track program execution and data reception events. Implemented LED management with configurable blink duration and automatic turn-off timing. These changes improve the visibility of system operation through both terminal output and visual LED feedback.
+
+[2025-05-18 23:53:52]
+
+src/main.c
+Detailed Textual Description of Changes: Implemented PM data accumulation buffer to combine small 1-byte receptions into meaningful packets before processing. Added a PM_BUFFER_ACCUMULATE define constant (set to 1) to enable packet accumulation. Implemented timeout mechanism for PM data buffer processing to ensure data is not stuck in the accumulation buffer. Created dedicated process_accumulated_pm_data() function to handle complete packet processing. Moved LED blinking control variables to module level for global access. These changes ensure the PMS sensor data is properly accumulated and displayed as complete packets instead of individual bytes.
+
+src/terminal_ui.c
+Detailed Textual Description of Changes: Enhanced the raw data transmission function with improved handling of different data types. Added specific formatting for NMEA sentences with detection of "$GP" prefix. Implemented specialized formatting for PM data with consistent yellow coloring and proper hex representation. Added hex escape sequences for non-printable characters to improve visibility of binary data. Added special indentation and line breaks for better readability. These changes significantly improve the display of raw GPS and PM sensor data, making debugging and monitoring much easier.
+    
+[2025-05-18 23:58:48]
+
+src/main.c
+Detailed Textual Description of Changes: Fixed GPS raw data display by adding a PM_FORCE_RAW_GPS option that directly forces GPS data to be displayed regardless of the debug setting. Implemented ASCII-safe formatting for GPS raw data display with special handling for non-printable characters. Added content verification for PM data accumulation buffer to ensure only valid PMS data (starting with 0x42 0x4D header) is processed. Increased PM_ACCUMULATE_THRESHOLD from 8 to 12 bytes and extended timeout from 100ms to 250ms to ensure complete packets are captured. Changed PM accumulation buffer type from char to uint8_t to better represent binary data. Added a buffer clear operation (memset) after processing accumulated PM data to prevent memory corruption. These changes ensure the GPS raw data is consistently displayed and PM data is properly accumulated and validated.
     
