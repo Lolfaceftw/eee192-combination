@@ -1,0 +1,17 @@
+# Add patterns to ignore here, one per line
+# Example:
+# *.log
+# tmp/
+.generated_files
+.git
+build
+debug
+dist
+nbproject
+original_files
+.cursorignore
+.gitignore
+.repomixignore
+Makefile
+repomix.config.json
+

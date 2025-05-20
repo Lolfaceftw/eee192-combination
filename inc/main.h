@@ -11,6 +11,7 @@
 #include <stdbool.h>
 #include "platform.h"      // For platform_usart_rx_async_desc_t, platform_usart_tx_bufdesc_t
 #include "parsers/pms_parser.h" // For pms_parser_internal_state_t, pms_data_t
+#include "parsers/nmea_parser.h" // For NMEA_PARSER_MAX_COORD_STR_LEN, NMEA_PARSER_MAX_TIME_STR_LEN
 // #include "parsers/nmea_parser.h" // Or nmea_parse.h - For any GPS specific data types if needed directly here
 
 // Application Flags (Example - to be expanded)
@@ -26,8 +27,8 @@
 // Buffer Sizes (Example - adjust as needed)
 #define CDC_TX_BUF_SZ                       256
 #define CDC_RX_BUF_SZ                       64
-#define GPS_RX_BUF_SZ                       128
-#define PM_RX_BUF_SZ                        64 // PMS data packets are small (e.g., 32 bytes for PMS5003)
+#define GPS_RX_BUF_SZ                       512
+#define PM_RX_BUF_SZ                        64          // Adjusted to 64 based on typical data frame size
 #define GPS_ASSEMBLY_BUF_SZ                 256 // To assemble full NMEA sentences
 
 /**
@@ -51,6 +52,7 @@ typedef struct prog_state_type {
     char                        parsed_gps_time[16];
     char                        parsed_gps_lat[20];
     char                        parsed_gps_lon[20];
+    char                        formatted_gpggl_string[NMEA_PARSER_MAX_COORD_STR_LEN * 2 + NMEA_PARSER_MAX_TIME_STR_LEN + 10]; // Buffer for the fully formatted GPGLL string
 
     // PM Sensor (SERCOM0)
     platform_usart_rx_async_desc_t pm_rx_desc;

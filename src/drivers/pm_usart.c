@@ -160,7 +160,7 @@ void pm_platform_usart_init(void){
 	 *       for UART one baud period corresponds to one bit.
 	 */
 	pm_ctx_uart.cfg.ts_idle_timeout.nr_sec  = 0;
-	pm_ctx_uart.cfg.ts_idle_timeout.nr_nsec = 781250; // Match GPS timeout value for consistency
+	pm_ctx_uart.cfg.ts_idle_timeout.nr_nsec = 50000000; // Match GPS timeout value for consistency
 	
 	/*
 	 * Third-to-the-last setup:

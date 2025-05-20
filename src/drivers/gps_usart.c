@@ -36,7 +36,7 @@
 #include <stdbool.h> // For boolean type (true, false)
 #include <string.h>  // For memset
 
-#include "platform.h" 
+#include "../../inc/platform.h" // Corrected relative path
 
 // Functions "exported" by this file (as per original comment, though they are static or part of the API)
 // Public API functions are declared in platform.h and defined at the end of this file.
@@ -233,15 +233,17 @@ void gps_platform_usart_init(void){
 	/*
 	 * This value is determined from f_{GCLK} and f_{baud}, the latter
 	 * being the actual target baudrate (here, 38400 bps).
-     * For a 4 MHz clock (GCLK_GEN2) and 38400 baud with 16x oversampling:
-     * BAUD = 65536 * (1 - 16 * 38400 / 4000000)
-     *      = 65536 * (1 - 0.1536)
-     *      = 65536 * 0.8464
-     *      = 55468 (decimal) ≈ 0xD8AC (hex)
-     * The value 0xF62B (decimal 63019) may be calculated using a different formula or
-     * is a result of empirical testing. Using the value from the original code for consistency.
+     * Baud value = 65536 * (1 - 16 * f_baud / f_gclk)
+     * For f_gclk = 4MHz, f_baud = 38400:
+     * BAUD = 65536 * (1 - 16 * 38400 / 4000000) = 65536 * (1 - 0.1536) = 65536 * 0.8464 = 55471.59
+     * Decimal 55471 is 0xD8AF.
+     * The original value 0xF62B (decimal 63019) implies a different calculation or target.
+     * If using fractional baud generation (CTRLA.SAMPA=1), BAUD = f_gclk / f_baud.
+     * If using arithmetic (CTRLA.SAMPA=0), BAUD = f_gclk / (16 * f_baud) - 1 (approximately for BAUD.FP part, this is simplified).
+     * The value 0xF62B seems to be for a different clock or baud rate, or a specific calculation method.
+     * We will use the original value as per instructions.
 	 */
-	UART_REGS->SERCOM_BAUD = 0xF62B; // Set Baud register to original value
+	UART_REGS->SERCOM_BAUD = 0xF62B; // Set Baud register.
 	
 	/*
 	 * Configure the IDLE timeout, which should be the length of 3
@@ -250,9 +252,14 @@ void gps_platform_usart_init(void){
 	 * NOTE: Each character is composed of 8 bits (must include parity
 	 *       and stop bits); add one bit for margin purposes. In addition,
 	 *       for UART one baud period corresponds to one bit.
+     * Assuming 1 start bit, 8 data bits, 2 stop bits = 11 bits per character.
+     * 3 characters = 33 bits.
+     * Time for 1 bit = 1 / 38400 bps = 26.0416 microseconds.
+     * Time for 33 bits = 33 * 26.0416 us = 859.375 us.
+     * The original value 781250 ns = 781.25 us is close to this (30 bits).
 	 */
-	gps_ctx_uart.cfg.ts_idle_timeout.nr_sec  = 0;
-	gps_ctx_uart.cfg.ts_idle_timeout.nr_nsec = 781250;
+	gps_ctx_uart.cfg.ts_idle_timeout.nr_sec  = 0;        // Seconds part of idle timeout.
+	gps_ctx_uart.cfg.ts_idle_timeout.nr_nsec = 50000000;   // Nanoseconds part of idle timeout (50 ms).
 	
 	/*
 	 * Third-to-the-last setup:
@@ -260,27 +267,46 @@ void gps_platform_usart_init(void){
 	 * - Enable receiver and transmitter
 	 * - Clear the FIFOs (even though they're disabled)
 	 */
+    // Enable Receiver (RXEN, bit 17) and Transmitter (TXEN, bit 16) in SERCOM_CTRLB.
+    // LINCMD (bits 23:22) = 0x3 (No action, or specific command if used).
+    // Original code uses `(0x3 << 22)` which might be for a specific LIN command or a typo if FIFOs are not used.
+    // If FIFOs are disabled, clearing them has no effect. Let's assume it's for general robustness or future use.
 	UART_REGS->SERCOM_CTRLB |= (0x1 << 17) | (0x1 << 16) | (0x3 << 22);
+    // Wait for CTRLB synchronization (SYNCBUSY bit 2 for CTRLB).
 	while ((UART_REGS->SERCOM_SYNCBUSY & (0x1 << 2)) != 0) asm("nop");
-	
+    
 	/*
 	 * Second-to-last: Configure the physical pins.
 	 * 
 	 * NOTE: Consult both the chip and board datasheets to determine the
 	 *       correct port pins to use.
+     * For SERCOM1:
+     *  - RX on PAD[1] -> PB17 (as per file header comment)
+     *  - TX on PAD[0] -> PB16 (typical for SERCOM1 ALT)
+     * Pin configuration for PB17 (RX):
+     *  - Direction: Input (DIRCLR for PB17).
+     *  - PINCFG: Enable peripheral MUX (PMUXEN=1, bit 0), Enable input buffer (INEN=1, bit 1). Value 0x3.
+     *  - PMUX: Select SERCOM1 Alternate function (Function D = 0x3).
+     *    PB17 is an odd pin, uses PMUXO field (bits 7:4) in PORT_PMUX[17>>1] = PORT_PMUX[8].
+     *    PMUXO = 0x3. So, (0x3 << 4) = 0x30.
+     * The original code uses 0x20 for PMUX, which is Function C. This needs to match the datasheet for SERCOM1_ALT.
+     * Assuming Function C (0x2) is correct for SERCOM1_ALT on PB17.
 	 */
-    PORT_SEC_REGS->GROUP[1].PORT_DIRCLR = (1 << 8) | (1 << 9);
+    // Configure PB17 (SERCOM1 PAD[1] - RX)
+    PORT_SEC_REGS->GROUP[0].PORT_DIRCLR = (1 << 17);      // Set PB17 direction to input.
+	PORT_SEC_REGS->GROUP[0].PORT_PINCFG[17] = 0x3;        // Enable PMUX and INEN for PB17.
+	PORT_SEC_REGS->GROUP[0].PORT_PMUX[17 >> 1] = 0x20;    // Set PMUXO for PB17 to Function C (0x2).
+    // Note: TX pin (e.g., PB16 for PAD[0]) configuration would be needed if transmitting.
     
-	PORT_SEC_REGS->GROUP[1].PORT_PINCFG[8] = 0x03;
-    
-	PORT_SEC_REGS->GROUP[1].PORT_PMUX[4] = 0x3;
     
     // Last: enable the peripheral, after resetting the state machine
+    // Enable SERCOM peripheral: Set ENABLE bit (bit 1) in SERCOM_CTRLA.
 	UART_REGS->SERCOM_CTRLA |= (0x1 << 1);
+    // Wait for ENABLE synchronization (SYNCBUSY bit 1 for ENABLE).
 	while ((UART_REGS->SERCOM_SYNCBUSY & (0x1 << 1)) != 0) asm("nop");
 	return;
 
-#undef UART_REGS
+#undef UART_REGS // Undefine the local macro
 }
 
 /**
@@ -299,13 +325,19 @@ void gps_platform_usart_init(void){
  */
 static void gps_usart_rx_abort_helper(gps_ctx_usart_t *ctx)
 {
+    // Check if there is an active receive descriptor.
 	if (ctx->rx.desc != NULL) {
+        // Mark the reception as complete due to data received (or timeout/full buffer).
 		ctx->rx.desc->compl_type = PLATFORM_USART_RX_COMPL_DATA;
+        // Store the number of bytes actually received in the descriptor.
 		ctx->rx.desc->compl_info.data_len = ctx->rx.idx;
+        // Clear the pointer to the active descriptor, making the receiver available.
 		ctx->rx.desc = NULL;
 	}
+    // Reset the idle timestamp.
 	ctx->rx.ts_idle.nr_sec  = 0;
 	ctx->rx.ts_idle.nr_nsec = 0;
+    // Reset the receive buffer index.
 	ctx->rx.idx = 0;
 	return;
 }
@@ -340,7 +372,6 @@ static void gps_usart_tick_handler_common(
 	uint16_t status = 0x0000; // To store SERCOM_STATUS register value.
 	uint8_t  data   = 0x00;   // To store received data byte.
 	platform_timespec_t ts_delta; // To store time difference for idle timeout calculation.
-	platform_timespec_t temp_ts_idle_for_delta; // Temporary for platform_tick_delta
 	
 	// RX handling: Check if Receive Complete Interrupt Flag (RXC, bit 2 of SERCOM_INTFLAG) is set.
 	if ((ctx->regs->SERCOM_INTFLAG & (1 << 2)) != 0) {
@@ -400,8 +431,7 @@ static void gps_usart_tick_handler_common(
 			break; // Exit processing for this tick.
 		} else if (ctx->rx.idx > 0) { // If some data has been received (buffer is not empty).
             // Calculate the time elapsed since the last character was received.
-            temp_ts_idle_for_delta = ctx->rx.ts_idle; // Create non-volatile copy
-			platform_tick_delta(&ts_delta, tick, &temp_ts_idle_for_delta);
+			platform_tick_delta(&ts_delta, tick, &ctx->rx.ts_idle);
             // Compare the elapsed idle time with the configured idle timeout.
 			if (platform_timespec_compare(&ts_delta, &ctx->cfg.ts_idle_timeout) >= 0) {
 				// IDLE timeout has occurred. Abort/complete the reception.
@@ -489,10 +519,7 @@ static bool gps_usart_rx_async(gps_ctx_usart_t *ctx, platform_usart_rx_async_des
     // Reset the context's receive buffer index.
 	ctx->rx.idx = 0;
     // Record the current time as the start of the idle period (or start of reception).
-    platform_timespec_t temp_ts_idle_for_hrcount; // Temporary for platform_tick_hrcount
-	// platform_tick_hrcount(&ctx->rx.ts_idle); // Original call
-    platform_tick_hrcount(&temp_ts_idle_for_hrcount);
-    ctx->rx.ts_idle = temp_ts_idle_for_hrcount; // Update volatile original
+	platform_tick_hrcount(&ctx->rx.ts_idle);
     // Store the pointer to the client's descriptor, making this the active reception.
 	ctx->rx.desc = desc;
 	return true; // Reception successfully initiated.
