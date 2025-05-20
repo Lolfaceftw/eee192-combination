@@ -11,14 +11,16 @@
 #include <string.h>
 
 // ANSI Escape Sequences
-static const char ANSI_RESET[] = "\033[0m";
+const char ANSI_RESET[] = "\033[0m";
+const char ANSI_MAGENTA[] = "\033[35m"; // Violet
+const char ANSI_YELLOW[]  = "\033[33m"; // Gold/Yellow  
+//static const char ANSI_RESET[] = "\033[0m";
 static const char ANSI_CLEAR_SCREEN[] = "\033[2J";
 static const char ANSI_CURSOR_HOME[] = "\033[1;1H";
 static const char ANSI_CLEAR_LINE[] = "\033[K";
 static const char ANSI_BOLD[] = "\033[1m";
 static const char ANSI_GREEN[] = "\033[32m";
 static const char ANSI_CYAN[] = "\033[36m";
-
 // Banner text
 static const char banner_text[] =
     "\033[0m"       // Reset terminal formatting

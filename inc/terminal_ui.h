@@ -13,7 +13,9 @@
 
 // Forward declaration of prog_state_t to avoid circular dependencies with main.c
 struct prog_state_type;
-
+extern const char ANSI_RESET[];
+extern const char ANSI_MAGENTA[];
+extern const char ANSI_YELLOW[];
 /**
  * @brief Handles the transmission of the application banner to the terminal.
  *

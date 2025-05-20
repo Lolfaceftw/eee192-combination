@@ -777,26 +777,34 @@ void ui_display_combined_data(prog_state_t *ps) {
         return;
     }
     
-    // Format and print the combined data
-    // The nmea_parse_gpgll_and_format function already includes "Lat:", "Long:", and time formatting.
-    // So we directly print its output, then append PM data.
+    char temp_format_buf[CDC_TX_BUF_SZ]; 
+
     if (ps->flags & PROG_FLAG_GPGLL_DATA_PARSED && ps->formatted_gpggl_string[0] != '\0') {
-        // Format: GPS: <formatted_gpggl_string> | PM: PM1.0 <val>, PM2.5 <val>, PM10 <val>
-        debug_printf(ps, "GPS: %s | PM: PM1.0: %u, PM2.5: %u, PM10: %u",
-                     ps->formatted_gpggl_string, 
-                     ps->latest_pms_data.pm1_0_atm, // Using ATM values as per typical use-case for ug/m3
-                     ps->latest_pms_data.pm2_5_atm, 
-                     ps->latest_pms_data.pm10_atm);
+        snprintf(temp_format_buf, sizeof(temp_format_buf),
+                 "%sGPS: %s%s | %sPM: PM1.0: %u, PM2.5: %u, PM10: %u%s",
+                 ANSI_MAGENTA, 
+                 ps->formatted_gpggl_string, 
+                 ANSI_RESET, 
+                 ANSI_YELLOW,  
+                 ps->latest_pms_data.pm1_0_atm, 
+                 ps->latest_pms_data.pm2_5_atm, 
+                 ps->latest_pms_data.pm10_atm,
+                 ANSI_RESET); 
     } else {
-        // Handle case where GPGLL data was expected but not successfully formatted
-        // Format: GPS: Data N/A | PM: PM1.0 <val>, PM2.5 <val>, PM10 <val>
-        debug_printf(ps, "GPS: Data N/A | PM: PM1.0: %u, PM2.5: %u, PM10: %u",
-                     ps->latest_pms_data.pm1_0_atm, 
-                     ps->latest_pms_data.pm2_5_atm, 
-                     ps->latest_pms_data.pm10_atm);
+        snprintf(temp_format_buf, sizeof(temp_format_buf),
+                 "%sGPS: Data N/A%s | %sPM: PM1.0: %u, PM2.5: %u, PM10: %u%s",
+                 ANSI_MAGENTA, 
+                 ANSI_RESET, 
+                 ANSI_YELLOW,  
+                 ps->latest_pms_data.pm1_0_atm, 
+                 ps->latest_pms_data.pm2_5_atm, 
+                 ps->latest_pms_data.pm10_atm,
+                 ANSI_RESET); 
     }
 
-    // Mark flags as processed or handle them as needed
-    ps->flags &= ~(PROG_FLAG_GPGLL_DATA_PARSED | PROG_FLAG_PM_DATA_PARSED);
-}
+    debug_printf(ps, "%s", temp_format_buf);
 
+    // Flag clearing is handled by the caller in prog_loop_one
+    // The line `ps->flags &= ~(PROG_FLAG_GPGLL_DATA_PARSED | PROG_FLAG_PM_DATA_PARSED);`
+    // was removed from here as per previous changes.md, and is handled in prog_loop_one.
+}
