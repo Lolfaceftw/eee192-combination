@@ -49,87 +49,92 @@ static const uint32_t PM_ACCUMULATE_TIMEOUT_MS = 300; // Slightly increased time
 static uint32_t led_blink_start_ms = 0;
 static bool led_is_blinking = false;
 
-// Add helper function to print hexdump for debugging
+// Function to print raw GPS data by calling the modified debug_printf for each line
+static void debug_print_gps_raw_data(prog_state_t *ps, const char *raw_data_buffer, uint16_t raw_data_len) {
+    if (raw_data_len == 0) return;
+
+    // Print the header for GPS raw data
+    debug_printf(ps, "GPS Raw Data:"); // This will print "[DEBUG] GPS Raw Data:\r\n"
+
+    const char *ptr = raw_data_buffer;
+    const char *end = raw_data_buffer + raw_data_len;
+    char line_buffer[NMEA_MAX_SENTENCE_LEN + 1]; // Buffer for a single line of GPS data
+
+    while (ptr < end) {
+        const char *line_end = ptr;
+        // Find the end of the current line (look for \n or \r)
+        while (line_end < end && *line_end != '\n' && *line_end != '\r') {
+            line_end++;
+        }
+
+        uint16_t line_len = line_end - ptr;
+        if (line_len > 0) {
+            if (line_len > NMEA_MAX_SENTENCE_LEN) {
+                line_len = NMEA_MAX_SENTENCE_LEN; // Truncate if too long for buffer
+            }
+            memcpy(line_buffer, ptr, line_len);
+            line_buffer[line_len] = '\0';
+            // Call the robust debug_printf for each individual line of GPS data
+            debug_printf(ps, "%s", line_buffer);
+        }
+
+        // Move pointer past the line ending characters for the next iteration
+        ptr = line_end;
+        while (ptr < end && (*ptr == '\n' || *ptr == '\r')) {
+            ptr++;
+        }
+    }
+}
+
+// Add helper function to print hexdump for debugging by calling the modified debug_printf for each line
 static void debug_print_hex(prog_state_t *ps, const uint8_t *data, uint16_t len) {
-    char hex_buffer[256]; // Buffer for formatting output string
-    int offset = 0;       // Current write offset in hex_buffer
-    uint32_t busy_wait_timeout; // Timeout counter for UART busy waits
-
-    // 1. Wait for any preceding UART transmission to complete or hardware to become free.
-    busy_wait_timeout = 20000; 
-    while (platform_usart_cdc_tx_busy() && busy_wait_timeout-- > 0) {
-        platform_do_loop_one(); // Yield/process other events, allowing UART TX to progress
+    // Print the header for the hexdump
+    if (len == 0) {
+        debug_printf(ps, "PM: the hexdump (0 bytes):");
+        return;
     }
-    if (platform_usart_cdc_tx_busy()) {
-        return; // UART is still busy after timeout, abort printing hexdump
-    }
+    debug_printf(ps, "PM: the hexdump (%u bytes):", len);
 
-    // 2. Format the header string, including the "[DEBUG]" prefix.
-    offset += snprintf(hex_buffer + offset, sizeof(hex_buffer) - offset, "[DEBUG] PM: the hexdump (%u bytes):\r\n", len);
+    char hex_line_buffer[80]; // Suitable buffer for one line of hex (e.g., 16 bytes * 3 chars + null)
+    int current_line_char_count;
 
-    // 3. Loop through data, adding hex values to buffer. Send buffer in chunks if it fills.
-    for (uint16_t i = 0; i < len; ++i) {
-        if (offset >= (sizeof(hex_buffer) - 4)) { // Need space for "XX " (3 chars) + safety margin
-            // Buffer is full, transmit current chunk
-            ps->cdc_tx_desc[0].buf = hex_buffer;
-            ps->cdc_tx_desc[0].len = offset;
-            ps->flags |= PROG_FLAG_CDC_TX_BUSY; 
-            if (platform_usart_cdc_tx_async(&ps->cdc_tx_desc[0], 1)) {
-                 ps->flags &= ~PROG_FLAG_CDC_TX_BUSY; 
+    for (uint16_t i = 0; i < len; i += 16) { // Process data in chunks of 16 bytes for each line
+        current_line_char_count = 0;
+        for (uint16_t j = 0; j < 16 && (i + j) < len; ++j) {
+            current_line_char_count += snprintf(hex_line_buffer + current_line_char_count, 
+                                              sizeof(hex_line_buffer) - current_line_char_count, 
+                                              "%02X ", 
+                                              data[i + j]);
+        }
+        if (current_line_char_count > 0) {
+            // Remove trailing space if one exists from the last %02X 
+            if (hex_line_buffer[current_line_char_count - 1] == ' ') {
+                hex_line_buffer[current_line_char_count - 1] = '\0';
             }
-
-            busy_wait_timeout = 20000;
-            while (platform_usart_cdc_tx_busy() && busy_wait_timeout-- > 0) {
-                platform_do_loop_one();
-            }
-            if (platform_usart_cdc_tx_busy()) {
-                return; // Abort if UART still busy
-            }
-            offset = 0; // Reset buffer for the next chunk
-        }
-        offset += snprintf(hex_buffer + offset, sizeof(hex_buffer) - offset, "%02X ", data[i]);
-    }
-
-    // 4. Send any remaining data in the buffer
-    if (offset > 0) {
-        if (offset > 0 && hex_buffer[offset - 1] == ' ') {
-            offset--; // Remove trailing space
-        }
-        if (offset < (sizeof(hex_buffer) - 2)) { 
-            hex_buffer[offset++] = '\r';
-            hex_buffer[offset++] = '\n';
-        } else if (offset < (sizeof(hex_buffer) - 1)) { 
-            hex_buffer[offset++] = '\n';
-        }
-
-        ps->cdc_tx_desc[0].buf = hex_buffer;
-        ps->cdc_tx_desc[0].len = offset;
-        ps->flags |= PROG_FLAG_CDC_TX_BUSY;
-        if (platform_usart_cdc_tx_async(&ps->cdc_tx_desc[0], 1)) {
-            ps->flags &= ~PROG_FLAG_CDC_TX_BUSY;
-        }
-
-        busy_wait_timeout = 20000;
-        while (platform_usart_cdc_tx_busy() && busy_wait_timeout-- > 0) {
-            platform_do_loop_one();
+            // Call the robust debug_printf for each formatted line of hex characters
+            debug_printf(ps, "%s", hex_line_buffer);
         }
     }
 }
 
 /**
- * @brief Basic debug print function - MODIFIED FOR SAFER CDC ACCESS.
+ * @brief Basic debug print function - MODIFIED FOR SAFER CDC ACCESS AND SERIALIZATION.
  * Sends formatted string to CDC terminal if not busy.
  * MUST be passed the app_state pointer.
  */
 void debug_printf(prog_state_t *ps, const char *fmt, ...) {
-    // If CDC is busy with another transmission, skip this debug message to avoid conflict
-    if (platform_usart_cdc_tx_busy() || (ps->flags & PROG_FLAG_CDC_TX_BUSY)) {
-        return;
+    uint32_t entry_wait_timeout = 30000; 
+    // Wait for any previous CDC transmission to complete (both software flag and hardware)
+    while(((ps->flags & PROG_FLAG_CDC_TX_BUSY) || platform_usart_cdc_tx_busy()) && entry_wait_timeout-- > 0) {
+        platform_do_loop_one();
+    }
+    if ((ps->flags & PROG_FLAG_CDC_TX_BUSY) || platform_usart_cdc_tx_busy()) {
+        // Still busy after timeout, cannot safely proceed. Consider logging this specific failure if a mechanism existed.
+        return; 
     }
     
-    // Use a local static buffer for initial formatting to avoid ps->cdc_tx_buf if it's in use by a multi-part message elsewhere
     static char local_debug_format_buf[256]; 
-    char final_debug_msg_buf[280]; // Buffer for "[DEBUG] " prefix + message + \r\n\0
+    char final_debug_msg_buf[280];
 
     va_list args;
     va_start(args, fmt);
@@ -140,42 +145,44 @@ void debug_printf(prog_state_t *ps, const char *fmt, ...) {
         return; // Formatting error or overflow
     }
 
-    // Prepend "[DEBUG] " and append \r\n
-    // Ensure the message ends with a newline for proper terminal display
-    // Check if the last char is already a newline, and second to last is carriage return
     bool ends_with_crlf = (len >= 2 && local_debug_format_buf[len-2] == '\r' && local_debug_format_buf[len-1] == '\n');
     bool ends_with_lf = (!ends_with_crlf && len >=1 && local_debug_format_buf[len-1] == '\n');
 
     if (ends_with_crlf) {
          snprintf(final_debug_msg_buf, sizeof(final_debug_msg_buf), "[DEBUG] %s", local_debug_format_buf);
     } else if (ends_with_lf) {
-         // Replace just LF with CRLF for consistency
-        local_debug_format_buf[len-1] = '\0'; // effectively truncate LF
+        local_debug_format_buf[len-1] = '\0';
         snprintf(final_debug_msg_buf, sizeof(final_debug_msg_buf), "[DEBUG] %s\r\n", local_debug_format_buf);
     } else {
         snprintf(final_debug_msg_buf, sizeof(final_debug_msg_buf), "[DEBUG] %s\r\n", local_debug_format_buf);
     }
     
-    // Update len to the new length of final_debug_msg_buf
     len = strlen(final_debug_msg_buf);
-    if (len == 0 || len >= sizeof(ps->cdc_tx_buf)) { // Check against the destination buffer
-        // Message too long for ps->cdc_tx_buf or empty, should not happen with reasonable fmt
+    if (len == 0 || (size_t)len >= sizeof(ps->cdc_tx_buf)) {
         return; 
     }
 
-    // Safely copy to the shared CDC TX buffer
-    memcpy(ps->cdc_tx_buf, final_debug_msg_buf, len + 1); // +1 for null terminator
+    memcpy(ps->cdc_tx_buf, final_debug_msg_buf, len + 1);
     
-    // Configure transmission descriptor using app_state's descriptor
-    ps->cdc_tx_desc[0].buf = ps->cdc_tx_buf; // Point to the message in app_state's buffer
+    ps->cdc_tx_desc[0].buf = ps->cdc_tx_buf;
     ps->cdc_tx_desc[0].len = len;
     
-    // Set busy flag and attempt transmission
-    ps->flags |= PROG_FLAG_CDC_TX_BUSY;
+    // This debug_printf call now owns the PROG_FLAG_CDC_TX_BUSY until hardware is clear
+    ps->flags |= PROG_FLAG_CDC_TX_BUSY; 
+
     if (platform_usart_cdc_tx_async(&ps->cdc_tx_desc[0], 1)) {
-        ps->flags &= ~PROG_FLAG_CDC_TX_BUSY; // Clear busy flag on success
+        // Successfully started async transmission
+        uint32_t hardware_wait_timeout = 30000; // Timeout for this specific transmission
+        while(platform_usart_cdc_tx_busy() && hardware_wait_timeout-- > 0) {
+            platform_do_loop_one();
+        }
+        // After waiting for hardware (or timeout), this debug_printf operation is considered complete.
+        // Clear the flag, regardless of hardware_wait_timeout outcome, to allow next print.
+        // If timeout occurred, data might be truncated/lost, but flag must be cleared.
+        ps->flags &= ~PROG_FLAG_CDC_TX_BUSY;
     } else {
-        // Transmission failed to start, flag remains set. Watchdog should handle if it gets stuck.
+        // Failed to start async transmission, so clear the flag immediately.
+        ps->flags &= ~PROG_FLAG_CDC_TX_BUSY;
     }
 }
 
@@ -416,11 +423,7 @@ static void prog_loop_one(void) {
             // Display raw GPS buffer for debugging if enabled or forced
             if (DEBUG_MODE_RAW_GPS || PM_FORCE_RAW_GPS) {
                 if (app_state.gps_assembly_len > 0) {
-                    debug_printf(&app_state, "GPS: Preparing to print RAW BUFFER (%u bytes). CDC Busy_HW: %d, CDC_Busy_Flag: %d", 
-                        app_state.gps_assembly_len, platform_usart_cdc_tx_busy(), (app_state.flags & PROG_FLAG_CDC_TX_BUSY) ? 1:0);
-                    // Explicitly clear the software busy flag before raw GPS buffer print
-                    app_state.flags &= ~PROG_FLAG_CDC_TX_BUSY;
-                    ui_handle_raw_data_transmission(&app_state, "GPS RAW BUFFER", app_state.gps_assembly_buf, app_state.gps_assembly_len);
+                    debug_print_gps_raw_data(&app_state, app_state.gps_assembly_buf, app_state.gps_assembly_len);
                 }
             }
         } else {
