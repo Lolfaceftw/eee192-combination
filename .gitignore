@@ -1,0 +1,10 @@
+build
+.generated_files
+debug
+dist
+nbproject
+Makefile
+sercom.md
+usart.md
+.cursorignore
+original_files

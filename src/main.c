@@ -49,6 +49,73 @@ static const uint32_t PM_ACCUMULATE_TIMEOUT_MS = 300; // Slightly increased time
 static uint32_t led_blink_start_ms = 0;
 static bool led_is_blinking = false;
 
+// Add helper function to print hexdump for debugging
+static void debug_print_hex(prog_state_t *ps, const uint8_t *data, uint16_t len) {
+    char hex_buffer[256]; // Buffer for formatting output string
+    int offset = 0;       // Current write offset in hex_buffer
+    uint32_t busy_wait_timeout; // Timeout counter for UART busy waits
+
+    // 1. Wait for any preceding UART transmission to complete or hardware to become free.
+    busy_wait_timeout = 20000; 
+    while (platform_usart_cdc_tx_busy() && busy_wait_timeout-- > 0) {
+        platform_do_loop_one(); // Yield/process other events, allowing UART TX to progress
+    }
+    if (platform_usart_cdc_tx_busy()) {
+        return; // UART is still busy after timeout, abort printing hexdump
+    }
+
+    // 2. Format the header string, including the "[DEBUG]" prefix.
+    offset += snprintf(hex_buffer + offset, sizeof(hex_buffer) - offset, "[DEBUG] PM: the hexdump (%u bytes):\r\n", len);
+
+    // 3. Loop through data, adding hex values to buffer. Send buffer in chunks if it fills.
+    for (uint16_t i = 0; i < len; ++i) {
+        if (offset >= (sizeof(hex_buffer) - 4)) { // Need space for "XX " (3 chars) + safety margin
+            // Buffer is full, transmit current chunk
+            ps->cdc_tx_desc[0].buf = hex_buffer;
+            ps->cdc_tx_desc[0].len = offset;
+            ps->flags |= PROG_FLAG_CDC_TX_BUSY; 
+            if (platform_usart_cdc_tx_async(&ps->cdc_tx_desc[0], 1)) {
+                 ps->flags &= ~PROG_FLAG_CDC_TX_BUSY; 
+            }
+
+            busy_wait_timeout = 20000;
+            while (platform_usart_cdc_tx_busy() && busy_wait_timeout-- > 0) {
+                platform_do_loop_one();
+            }
+            if (platform_usart_cdc_tx_busy()) {
+                return; // Abort if UART still busy
+            }
+            offset = 0; // Reset buffer for the next chunk
+        }
+        offset += snprintf(hex_buffer + offset, sizeof(hex_buffer) - offset, "%02X ", data[i]);
+    }
+
+    // 4. Send any remaining data in the buffer
+    if (offset > 0) {
+        if (offset > 0 && hex_buffer[offset - 1] == ' ') {
+            offset--; // Remove trailing space
+        }
+        if (offset < (sizeof(hex_buffer) - 2)) { 
+            hex_buffer[offset++] = '\r';
+            hex_buffer[offset++] = '\n';
+        } else if (offset < (sizeof(hex_buffer) - 1)) { 
+            hex_buffer[offset++] = '\n';
+        }
+
+        ps->cdc_tx_desc[0].buf = hex_buffer;
+        ps->cdc_tx_desc[0].len = offset;
+        ps->flags |= PROG_FLAG_CDC_TX_BUSY;
+        if (platform_usart_cdc_tx_async(&ps->cdc_tx_desc[0], 1)) {
+            ps->flags &= ~PROG_FLAG_CDC_TX_BUSY;
+        }
+
+        busy_wait_timeout = 20000;
+        while (platform_usart_cdc_tx_busy() && busy_wait_timeout-- > 0) {
+            platform_do_loop_one();
+        }
+    }
+}
+
 /**
  * @brief Basic debug print function - MODIFIED FOR SAFER CDC ACCESS.
  * Sends formatted string to CDC terminal if not busy.
@@ -132,6 +199,8 @@ static void process_accumulated_pm_data(struct prog_state_type *ps) {
     }
     
     debug_printf(ps, "PM: Processing accumulated %u bytes", pm_accumulate_len);
+    // Call the new hexdump function
+    debug_print_hex(ps, pm_accumulate_buffer, pm_accumulate_len);
     
     bool valid_pm_header = false;
     if (pm_accumulate_len >= 2 && pm_accumulate_buffer[0] == 0x42 && pm_accumulate_buffer[1] == 0x4D) {
