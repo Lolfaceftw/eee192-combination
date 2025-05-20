@@ -56,6 +56,14 @@ static bool led_is_blinking = false;
 // Forward declarations
 void debug_printf(prog_state_t *ps, const char *fmt, ...);
 void ui_display_combined_data(prog_state_t *ps);
+static uint8_t nmea_calculate_checksum(const char *sentence_data);
+static void generate_fake_gprmc(prog_state_t *ps, char *buffer, size_t buffer_size);
+static void generate_fake_gpvtg(prog_state_t *ps, char *buffer, size_t buffer_size); // New
+static void generate_fake_gpgga(prog_state_t *ps, char *buffer, size_t buffer_size); // New
+static void generate_fake_gpgsa(prog_state_t *ps, char *buffer, size_t buffer_size); // New
+static void generate_fake_gpgsv(prog_state_t *ps, char *buffer, size_t buffer_size, int msg_num, int total_msgs, int *sats_in_this_msg); // Modified for multi-message
+static void generate_fake_gpgll(prog_state_t *ps, char *buffer, size_t buffer_size);
+static void inject_fake_gps_data(prog_state_t *ps);
 
 // Function to print raw GPS data by calling the modified debug_printf for each line
 static void debug_print_gps_raw_data(prog_state_t *ps, const char *raw_data_buffer, uint16_t raw_data_len) {
@@ -111,7 +119,119 @@ static uint8_t nmea_calculate_checksum(const char *sentence_data) {
     }
     return checksum;
 }
+static void generate_fake_gpvtg(prog_state_t *ps, char *buffer, size_t buffer_size) {
+    float course_true = (rand() % 3600) / 10.0; // 0.0 to 359.9
+    float speed_knots = (rand() % 500) / 10.0;  // 0.0 to 49.9
+    float speed_kmh = speed_knots * 1.852;
 
+    char sentence_data[100];
+    snprintf(sentence_data, sizeof(sentence_data),
+             "GPVTG,%.1f,T,,M,%.1f,N,%.1f,K,A", // Mode 'A' for Autonomous
+             course_true, speed_knots, speed_kmh);
+    uint8_t checksum = nmea_calculate_checksum(sentence_data);
+    snprintf(buffer, buffer_size, "$%s*%02X\r\n", sentence_data, checksum);
+}
+
+static void generate_fake_gpgga(prog_state_t *ps, char *buffer, size_t buffer_size) {
+    // Reuse time from GPRMC or GPGLL for consistency if needed, or generate new
+    static int fake_gga_time_sec = 10000; 
+    fake_gga_time_sec = (fake_gga_time_sec + 5) % (24 * 3600); // Increment differently
+    int hh = fake_gga_time_sec / 3600;
+    int mm = (fake_gga_time_sec % 3600) / 60;
+    int ss = fake_gga_time_sec % 60;
+
+    double lat_deg = (rand() % 900000) / 10000.0; char lat_ns = (rand() % 2 == 0) ? 'N' : 'S';
+    int lat_d = floor(lat_deg); double lat_m = (lat_deg - lat_d) * 60.0;
+    double lon_deg = (rand() % 1800000) / 10000.0; char lon_ew = (rand() % 2 == 0) ? 'E' : 'W';
+    int lon_d = floor(lon_deg); double lon_m = (lon_deg - lon_d) * 60.0;
+
+    int fix_quality = 1; // 1 = GPS fix
+    int num_sats = (rand() % 8) + 4; // 4 to 11 satellites
+    float hdop = (rand() % 50) / 10.0 + 0.5; // 0.5 to 5.4
+    float altitude = (rand() % 10000) / 10.0 - 100.0; // -100.0 to 899.9 m
+    float geoid_sep = (rand() % 1000) / 10.0 - 50.0; // -50.0 to 49.9 m
+
+    char sentence_data[120];
+    snprintf(sentence_data, sizeof(sentence_data),
+             "GPGGA,%02d%02d%02d.00,%02d%07.4f,%c,%03d%07.4f,%c,%d,%02d,%.1f,%.1f,M,%.1f,M,,",
+             hh, mm, ss,
+             lat_d, lat_m, lat_ns,
+             lon_d, lon_m, lon_ew,
+             fix_quality, num_sats, hdop, altitude, geoid_sep);
+    uint8_t checksum = nmea_calculate_checksum(sentence_data);
+    snprintf(buffer, buffer_size, "$%s*%02X\r\n", sentence_data, checksum);
+}
+
+static void generate_fake_gpgsa(prog_state_t *ps, char *buffer, size_t buffer_size) {
+    char mode = 'A'; // Automatic
+    int fix_type = 3; // 3D fix
+    int num_sats_in_fix = (rand() % 6) + 3; // 3 to 8 satellites in fix
+    char sat_ids_str[60] = ""; // Max 12 sats * (2 digits + comma)
+    for (int i = 0; i < num_sats_in_fix; ++i) {
+        char temp_sat[5];
+        snprintf(temp_sat, sizeof(temp_sat), "%d,", (rand() % 32) + 1); // PRN 1-32
+        strcat(sat_ids_str, temp_sat);
+    }
+    // Fill remaining fields with blanks if fewer than 12 sats
+    for (int i = num_sats_in_fix; i < 12; ++i) {
+        strcat(sat_ids_str, ",");
+    }
+    if (strlen(sat_ids_str) > 0) sat_ids_str[strlen(sat_ids_str)-1] = '\0'; // Remove trailing comma
+
+    float pdop = (rand() % 60) / 10.0 + 1.0; // 1.0 to 6.9
+    float hdop = (rand() % 50) / 10.0 + 0.5; // 0.5 to 5.4
+    float vdop = (rand() % 50) / 10.0 + 0.5; // 0.5 to 5.4
+
+    char sentence_data[120];
+    snprintf(sentence_data, sizeof(sentence_data),
+             "GPGSA,%c,%d,%s,%.1f,%.1f,%.1f",
+             mode, fix_type, sat_ids_str, pdop, hdop, vdop);
+    uint8_t checksum = nmea_calculate_checksum(sentence_data);
+    snprintf(buffer, buffer_size, "$%s*%02X\r\n", sentence_data, checksum);
+}
+
+// GPGSV can be multiple messages. This generates one message.
+// sats_in_this_msg returns how many sats were described in this particular GSV message.
+static void generate_fake_gpgsv(prog_state_t *ps, char *buffer, size_t buffer_size, int msg_num, int total_msgs, int *sats_generated_count) {
+    int total_sats_in_view = (rand() % 8) + 5; // 5 to 12 satellites in view overall
+    if (msg_num == 1) { // Only set total sats on the first message of a potential sequence
+        ps->latest_pms_data.particles_0_3um = total_sats_in_view; // Temporary use of a field to store total_sats_in_view for multi-msg
+    } else {
+        total_sats_in_view = ps->latest_pms_data.particles_0_3um; // Retrieve for subsequent messages
+    }
+
+
+    char sat_info_str[80] = "";
+    int sats_this_sentence = 0;
+    int sat_base_idx = (msg_num - 1) * 4;
+
+    for (int i = 0; i < 4; ++i) {
+        if (sat_base_idx + i < total_sats_in_view) {
+            char temp_sat_info[20];
+            int prn = (rand() % 32) + 1;
+            int elev = rand() % 91; // 0-90
+            int azim = rand() % 360; // 0-359
+            int snr = (rand() % 50) + 10; // 10-59 dB, or blank if not tracking
+            if (rand() % 5 == 0) { // 20% chance of no SNR (not tracking well)
+                 snprintf(temp_sat_info, sizeof(temp_sat_info), "%02d,%02d,%03d,", prn, elev, azim);
+            } else {
+                 snprintf(temp_sat_info, sizeof(temp_sat_info), "%02d,%02d,%03d,%02d,", prn, elev, azim, snr);
+            }
+            strcat(sat_info_str, temp_sat_info);
+            sats_this_sentence++;
+        }
+    }
+    if (strlen(sat_info_str) > 0) sat_info_str[strlen(sat_info_str)-1] = '\0'; // Remove trailing comma
+
+    *sats_generated_count = sats_this_sentence;
+
+    char sentence_data[120];
+    snprintf(sentence_data, sizeof(sentence_data),
+             "GPGSV,%d,%d,%02d,%s",
+             total_msgs, msg_num, total_sats_in_view, sat_info_str);
+    uint8_t checksum = nmea_calculate_checksum(sentence_data);
+    snprintf(buffer, buffer_size, "$%s*%02X\r\n", sentence_data, checksum);
+}
 // New Helper: Inject Fake GPS Data (simplified example)
 static void generate_fake_gpgll(prog_state_t *ps, char *buffer, size_t buffer_size) {
     static int fake_time_sec = 0;
@@ -179,33 +299,66 @@ static void generate_fake_gprmc(prog_state_t *ps, char *buffer, size_t buffer_si
 
 
 static void inject_fake_gps_data(prog_state_t *ps) {
-    char sentence_buffer[NMEA_ASSEMBLY_BUF_SZ]; // Temp buffer for one sentence, NMEA_ASSEMBLY_BUF_SZ is too large, use smaller like 128
-    char single_sentence[128];
+    char single_sentence[128]; // Buffer for one sentence
 
-    // Clear assembly buffer before injecting a new set of fake data
     ps->gps_assembly_len = 0;
     memset(ps->gps_assembly_buf, 0, GPS_ASSEMBLY_BUF_SZ);
 
-    // Generate and inject GPRMC
-    generate_fake_gprmc(ps, single_sentence, sizeof(single_sentence));
-    if (ps->gps_assembly_len + strlen(single_sentence) < GPS_ASSEMBLY_BUF_SZ) {
-        strcat(ps->gps_assembly_buf, single_sentence);
-        ps->gps_assembly_len += strlen(single_sentence);
-    }
-    
-    // Generate and inject GPGLL
-    generate_fake_gpgll(ps, single_sentence, sizeof(single_sentence));
-    if (ps->gps_assembly_len + strlen(single_sentence) < GPS_ASSEMBLY_BUF_SZ) {
-        strcat(ps->gps_assembly_buf, single_sentence);
-        ps->gps_assembly_len += strlen(single_sentence);
-    }
-    
-    // Add other sentences (GPVTG, GPGGA, GPGSA, GPGSV) here if desired
-    // For example:
-    // generate_fake_gpgga(ps, single_sentence, sizeof(single_sentence));
-    // if (ps->gps_assembly_len + strlen(single_sentence) < GPS_ASSEMBLY_BUF_SZ) { ... }
+    // Modified APPEND_SENTENCE macro (from previous step, kept for diagnostics for now)
+    #define APPEND_SENTENCE(sentence_name_str, sentence_content_str) \
+        if (strlen(sentence_content_str) > 0 && (ps->gps_assembly_len + strlen(sentence_content_str) < GPS_ASSEMBLY_BUF_SZ)) { \
+            strcat(ps->gps_assembly_buf, sentence_content_str); \
+            ps->gps_assembly_len += strlen(sentence_content_str); \
+        } else if (strlen(sentence_content_str) == 0) { \
+            debug_printf(ps, "Warning: generated empty sentence for %s, not appended.", sentence_name_str); \
+        } else { \
+            debug_printf(ps, "Warning: GPS assembly buffer full, could not append %s: %s", sentence_name_str, sentence_content_str); \
+        }
 
+    memset(single_sentence, 0, sizeof(single_sentence)); 
+    generate_fake_gprmc(ps, single_sentence, sizeof(single_sentence)); 
+    APPEND_SENTENCE("GPRMC", single_sentence);
+    
+    memset(single_sentence, 0, sizeof(single_sentence)); 
+    generate_fake_gpvtg(ps, single_sentence, sizeof(single_sentence)); 
+    APPEND_SENTENCE("GPVTG", single_sentence);
+
+    memset(single_sentence, 0, sizeof(single_sentence)); 
+    generate_fake_gpgga(ps, single_sentence, sizeof(single_sentence)); 
+    APPEND_SENTENCE("GPGGA", single_sentence);
+
+    memset(single_sentence, 0, sizeof(single_sentence)); 
+    generate_fake_gpgsa(ps, single_sentence, sizeof(single_sentence)); 
+    APPEND_SENTENCE("GPGSA", single_sentence);
+
+    // GPGSV generation loop
+    int total_sats_in_view_for_gsv_set = (rand() % 8) + 5; 
+    ps->latest_pms_data.particles_0_3um = total_sats_in_view_for_gsv_set; 
+    int total_gsv_messages = (total_sats_in_view_for_gsv_set + 3) / 4; 
+    if (total_gsv_messages == 0 && total_sats_in_view_for_gsv_set > 0) total_gsv_messages = 1;
+    if (total_gsv_messages == 0 && total_sats_in_view_for_gsv_set == 0) total_gsv_messages = 1;
+
+    int sats_described_in_gsv;
+    for (int i = 1; i <= total_gsv_messages; ++i) {
+        memset(single_sentence, 0, sizeof(single_sentence)); 
+        generate_fake_gpgsv(ps, single_sentence, sizeof(single_sentence), i, total_gsv_messages, &sats_described_in_gsv);
+        APPEND_SENTENCE("GPGSV", single_sentence);
+        if (sats_described_in_gsv == 0 && i==1 && total_sats_in_view_for_gsv_set > 0) {
+             debug_printf(ps, "Warning: First GPGSV message for %d total sats was empty, breaking GSV loop.", total_sats_in_view_for_gsv_set);
+            break;
+        }
+    }
+
+    // ** THIS IS THE CRITICAL PART THAT WAS MISSING FROM THE PREVIOUS CODE BLOCK DISPLAY **
+    memset(single_sentence, 0, sizeof(single_sentence)); 
+    generate_fake_gpgll(ps, single_sentence, sizeof(single_sentence)); 
+    APPEND_SENTENCE("GPGLL", single_sentence);
+    // ** END OF CRITICAL PART **
+    
     debug_printf(ps, "Injected %u bytes of FAKE GPS data.", ps->gps_assembly_len);
+    
+    // Undefine macro locally if it's not needed elsewhere, or define it at file scope if preferred
+    #undef APPEND_SENTENCE 
 }
 
 

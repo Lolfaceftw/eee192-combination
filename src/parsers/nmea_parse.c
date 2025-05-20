@@ -290,12 +290,10 @@ bool nmea_parse_gpgll_and_format(const char* gpgll_sentence, char* out_buf, size
 
     // --- Combine into the final output buffer ---
     // Format: "LocalTime | Latitude String | Longitude String\r\n"
-    int written = snprintf(out_buf, out_buf_size, "%s | %s | %s%s",
+    int written = snprintf(out_buf, out_buf_size, "%s | %s | %s",
                            time_output_str,    // Formatted local time
                            lat_output_str,     // Formatted latitude
-                           lon_output_str,     // Formatted longitude
-                           NMEA_LINE_ENDING_INTERNAL); // Append CRLF
-
+                           lon_output_str); 
     // Return true if snprintf was successful (written > 0) and the output was not truncated
     // (written < out_buf_size).
     return (written > 0 && (size_t)written < out_buf_size);

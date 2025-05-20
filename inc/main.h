@@ -27,10 +27,10 @@
 // Buffer Sizes (Example - adjust as needed)
 #define CDC_TX_BUF_SZ                       256
 #define CDC_RX_BUF_SZ                       64
-#define GPS_RX_BUF_SZ                       512
+#define GPS_RX_BUF_SZ                       2048
 #define PM_RX_BUF_SZ                        64          // Adjusted to 64 based on typical data frame size
-#define GPS_ASSEMBLY_BUF_SZ                 256 // To assemble full NMEA sentences
-#define NMEA_ASSEMBLY_BUF_SZ 128
+#define GPS_ASSEMBLY_BUF_SZ                 512 // To assemble full NMEA sentences
+#define NMEA_ASSEMBLY_BUF_SZ 512
 /**
  * @brief Main application state structure.
  */
