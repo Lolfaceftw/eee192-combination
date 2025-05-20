@@ -1,4 +1,4 @@
 build/default/production/platform/usart.o: platform/usart.c \
- platform/../inc/platform.h
+ inc/parsers/../platform.h
 
-platform/../inc/platform.h:
+inc/parsers/../platform.h:

@@ -3,6 +3,7 @@
  * @brief Platform-support routines, USART component
  *
  * @author Alberto de Villa <alberto.de.villa@eee.upd.edu.ph>
+ * @author Modified by: Estrada
  * @date   28 Oct 2024
  */
 
@@ -24,10 +25,12 @@
 #include <stdbool.h>
 #include <string.h>
 
-#include "../inc/platform.h"
+#include "../platform.h"
 
 // Functions "exported" by this file
 void platform_usart_init(void);
+void platform_usart_gps_init(void);
+void platform_usart_pm_init(void);
 void platform_usart_tick_handler(const platform_timespec_t *tick);
 
 /////////////////////////////////////////////////////////////////////////////
@@ -73,9 +76,12 @@ typedef struct ctx_usart_type {
 	} cfg;
 	
 } ctx_usart_t;
-static ctx_usart_t ctx_uart;
 
-// Configure USART
+static ctx_usart_t ctx_uart;
+static ctx_usart_t ctx_uart_gps;
+static ctx_usart_t ctx_uart_pm;
+
+// Configure USART (this includes HC12)
 void platform_usart_init(void){
 	/*
 	 * For ease of typing, #define a macro corresponding to the SERCOM
@@ -84,7 +90,7 @@ void platform_usart_init(void){
 	 * To avoid namespace pollution, this macro is #undef'd at the end of
 	 * this function.
 	 */
-#define UART_REGS (&(SERCOM3_REGS->USART_INT))
+	#define UART_REGS (&(SERCOM3_REGS->USART_INT))
 	
 	/*
 	 * Enable the APB clock for this peripheral
@@ -141,7 +147,7 @@ void platform_usart_init(void){
 	
 	/*
 	 * This value is determined from f_{GCLK} and f_{baud}, the latter
-	 * being the actual target baudrate (here, 38400 bps).
+	 * being the actual target baudrate (here, 9600 bps).
 	 */
 	UART_REGS->SERCOM_BAUD = 0xF62B;
 	
@@ -171,11 +177,8 @@ void platform_usart_init(void){
 	 * NOTE: Consult both the chip and board datasheets to determine the
 	 *       correct port pins to use.
 	 */
-	// <insert code here>
-    PORT_SEC_REGS->GROUP[1].PORT_DIRCLR = (1 << 8) | (1 << 9);
-    
-	PORT_SEC_REGS->GROUP[1].PORT_PINCFG[8] = 0x03;
-    
+    PORT_SEC_REGS->GROUP[1].PORT_DIRCLR = (1 << 8);
+	PORT_SEC_REGS->GROUP[1].PORT_PINCFG[8] = 0x3;
 	PORT_SEC_REGS->GROUP[1].PORT_PMUX[4] = 0x3;
     
     // Last: enable the peripheral, after resetting the state machine
@@ -186,9 +189,80 @@ void platform_usart_init(void){
 #undef UART_REGS
 }
 
+// Configure USART for GPS, documentation same as above
+void platform_usart_gps_init(void){
+	#define UART_REGS (&(SERCOM1_REGS->USART_INT))
+	GCLK_REGS->GCLK_PCHCTRL[18] = 0x00000042;
+	while ((GCLK_REGS->GCLK_PCHCTRL[18] & 0x00000040) == 0) asm("nop");
+
+	memset(&ctx_uart_gps, 0, sizeof(ctx_uart_gps));
+	ctx_uart_gps.regs = UART_REGS;
+	
+	UART_REGS->SERCOM_CTRLA = (0x1 << 0);
+	while((UART_REGS->SERCOM_SYNCBUSY & (0x1 << 0)) != 0) asm("nop");
+	UART_REGS->SERCOM_CTRLA = (uint32_t)(0x1 << 2);
+		
+	UART_REGS->SERCOM_CTRLA |= (0x0 << 13) | (0x1 << 30) | (0x0 << 24) | (0x1 << 20);
+	UART_REGS->SERCOM_CTRLB |= (0x1 << 6) | (0x0 << 0);
+	//UART_REGS->SERCOM_CTRLC |= ???;
+	
+	UART_REGS->SERCOM_BAUD = 0xF62B;
+	
+	ctx_uart_gps.cfg.ts_idle_timeout.nr_sec  = 0;
+	ctx_uart_gps.cfg.ts_idle_timeout.nr_nsec = 781250;
+	
+	UART_REGS->SERCOM_CTRLB |= (0x1 << 17) | (0x1 << 16) | (0x3 << 22);
+	while ((UART_REGS->SERCOM_SYNCBUSY & (0x1 << 2)) != 0) asm("nop");
+    
+    PORT_SEC_REGS->GROUP[0].PORT_DIRCLR = (1 << 17);
+	PORT_SEC_REGS->GROUP[0].PORT_PINCFG[17] = 0x3;
+	PORT_SEC_REGS->GROUP[0].PORT_PMUX[17 >> 1] = 0x20;
+    
+	UART_REGS->SERCOM_CTRLA |= (0x1 << 1);
+	while ((UART_REGS->SERCOM_SYNCBUSY & (0x1 << 1)) != 0) asm("nop");
+	return;
+
+#undef UART_REGS
+}
+
+// Configure USART for PM, documentation same as above
+void platform_usart_pm_init(void){
+	#define UART_REGS (&(SERCOM0_REGS->USART_INT))
+	GCLK_REGS->GCLK_PCHCTRL[17] = 0x00000042;
+	while ((GCLK_REGS->GCLK_PCHCTRL[17] & 0x00000040) == 0) asm("nop");
+	
+	memset(&ctx_uart_pm, 0, sizeof(ctx_uart_pm));
+	ctx_uart_pm.regs = UART_REGS;
+
+	UART_REGS->SERCOM_CTRLA = (0x1 << 0);
+	while((UART_REGS->SERCOM_SYNCBUSY & (0x1 << 0)) != 0) asm("nop");
+	UART_REGS->SERCOM_CTRLA = (uint32_t)(0x1 << 2);
+
+	UART_REGS->SERCOM_CTRLA |= (0x0 << 13) | (0x1 << 30) | (0x0 << 24) | (0x1 << 20);
+	UART_REGS->SERCOM_CTRLB |= (0x0 << 6) | (0x0 << 0);
+	//UART_REGS->SERCOM_CTRLC |= ???;
+	
+	UART_REGS->SERCOM_BAUD = 0xF62B;
+	
+	ctx_uart_pm.cfg.ts_idle_timeout.nr_sec  = 0;
+	ctx_uart_pm.cfg.ts_idle_timeout.nr_nsec = 781250;
+	
+	UART_REGS->SERCOM_CTRLB |= (0x1 << 17) | (0x1 << 16) | (0x3 << 22);
+	while ((UART_REGS->SERCOM_SYNCBUSY & (0x1 << 2)) != 0) asm("nop");
+
+    PORT_SEC_REGS->GROUP[0].PORT_DIRCLR = (1 << 5);
+	PORT_SEC_REGS->GROUP[0].PORT_PINCFG[5] = 0x3;
+	PORT_SEC_REGS->GROUP[0].PORT_PMUX[5 >> 1] = 0x30;
+    
+	UART_REGS->SERCOM_CTRLA |= (0x1 << 1);
+	while ((UART_REGS->SERCOM_SYNCBUSY & (0x1 << 1)) != 0) asm("nop");
+	return;
+
+	#undef UART_REGS
+}
+
 // Helper abort routine for USART reception
-static void usart_rx_abort_helper(ctx_usart_t *ctx)
-{
+static void usart_rx_abort_helper(ctx_usart_t *ctx){
 	if (ctx->rx.desc != NULL) {
 		ctx->rx.desc->compl_type = PLATFORM_USART_RX_COMPL_DATA;
 		ctx->rx.desc->compl_info.data_len = ctx->rx.idx;
@@ -202,8 +276,7 @@ static void usart_rx_abort_helper(ctx_usart_t *ctx)
 
 // Tick handler for the USART
 static void usart_tick_handler_common(
-	ctx_usart_t *ctx, const platform_timespec_t *tick)
-{
+	ctx_usart_t *ctx, const platform_timespec_t *tick){
 	uint16_t status = 0x0000;
 	uint8_t  data   = 0x00;
 	platform_timespec_t ts_delta;
@@ -255,13 +328,57 @@ static void usart_tick_handler_common(
 			}
 		}
 	}
+
+	// RX handling
+	if ((ctx->regs->SERCOM_INTFLAG & (1 << 2)) != 0) {
+		/*
+		 * There are unread data
+		 * 
+		 * To enable readout of error conditions, STATUS must be read
+		 * before reading DATA.
+		 * 
+		 * NOTE: Piggyback on Bit 15, as it is undefined for this
+		 *       platform.
+		 */
+		status = ctx->regs->SERCOM_STATUS | 0x8000;
+		data   = (uint8_t)(ctx->regs->SERCOM_DATA);
+	}
+	do {
+		if (ctx->rx.desc == NULL) {
+			// Nowhere to store any read data
+			break;
+		}
+
+		if ((status & 0x8003) == 0x8000) {
+			// No errors detected
+			ctx->rx.desc->buf[ctx->rx.idx++] = data;
+			ctx->rx.ts_idle = *tick;
+		}
+		ctx->regs->SERCOM_STATUS |= (status & 0x00F7);
+
+		// Some housekeeping
+		if (ctx->rx.idx >= ctx->rx.desc->max_len) {
+			// Buffer completely filled
+			usart_rx_abort_helper(ctx);
+			break;
+		} else if (ctx->rx.idx > 0) {
+			platform_tick_delta(&ts_delta, tick, &ctx->rx.ts_idle);
+			if (platform_timespec_compare(&ts_delta, &ctx->cfg.ts_idle_timeout) >= 0) {
+				// IDLE timeout
+				usart_rx_abort_helper(ctx);
+				break;
+			}
+		}
+	} while (0);
     
 	// Done
 	return;
 }
-void platform_usart_tick_handler(const platform_timespec_t *tick)
-{
+
+void platform_usart_tick_handler(const platform_timespec_t *tick){
 	usart_tick_handler_common(&ctx_uart, tick);
+	usart_tick_handler_common(&ctx_uart_gps, tick);
+	usart_tick_handler_common(&ctx_uart_pm, tick);
 }
 
 /// Maximum number of bytes that may be sent (or received) in one transaction
@@ -271,15 +388,14 @@ void platform_usart_tick_handler(const platform_timespec_t *tick)
 #define NR_USART_TX_FRAG_MAX (32)
 
 // Enqueue a buffer for transmission
-static bool usart_tx_busy(ctx_usart_t *ctx)
-{
+static bool usart_tx_busy(ctx_usart_t *ctx){
 	return (ctx->tx.len > 0) || (ctx->tx.nr_desc > 0) ||
 		((ctx->regs->SERCOM_INTFLAG & (1 << 0)) == 0);
 }
+
 static bool usart_tx_async(ctx_usart_t *ctx,
 	const platform_usart_tx_bufdesc_t *desc,
-	unsigned int nr_desc)
-{
+	unsigned int nr_desc){
 	uint16_t avail = NR_USART_CHARS_MAX;
 	unsigned int x, y;
 	
@@ -308,8 +424,8 @@ static bool usart_tx_async(ctx_usart_t *ctx,
 	ctx->tx.nr_desc = nr_desc;
 	return true;
 }
-static void usart_tx_abort(ctx_usart_t *ctx)
-{
+
+static void usart_tx_abort(ctx_usart_t *ctx){
 	ctx->tx.nr_desc = 0;
 	ctx->tx.desc = NULL;
 	ctx->tx.len = 0;
@@ -317,30 +433,28 @@ static void usart_tx_abort(ctx_usart_t *ctx)
 	return;
 }
 
-// API-visible items
+// API-visible items (HC 12 only as the other sensors are only sending)
 bool platform_usart_cdc_tx_async(
 	const platform_usart_tx_bufdesc_t *desc,
-	unsigned int nr_desc)
-{
+	unsigned int nr_desc){
 	return usart_tx_async(&ctx_uart, desc, nr_desc);
 }
-bool platform_usart_cdc_tx_busy(void)
-{
+
+bool platform_usart_cdc_tx_busy(void){
 	return usart_tx_busy(&ctx_uart);
 }
-void platform_usart_cdc_tx_abort(void)
-{
+
+void platform_usart_cdc_tx_abort(void){
 	usart_tx_abort(&ctx_uart);
 	return;
 }
 
 // Begin a receive transaction
-static bool usart_rx_busy(ctx_usart_t *ctx)
-{
+static bool usart_rx_busy(ctx_usart_t *ctx){
 	return (ctx->rx.desc) != NULL;
 }
-static bool usart_rx_async(ctx_usart_t *ctx, platform_usart_rx_async_desc_t *desc)
-{
+
+static bool usart_rx_async(ctx_usart_t *ctx, platform_usart_rx_async_desc_t *desc){
 	// Check some items first
 	if (!desc|| !desc->buf || desc->max_len == 0 || desc->max_len > NR_USART_CHARS_MAX)
 		// Invalid descriptor
@@ -359,31 +473,41 @@ static bool usart_rx_async(ctx_usart_t *ctx, platform_usart_rx_async_desc_t *des
 }
 
 // API-visible items
-bool platform_usart_cdc_rx_async(platform_usart_rx_async_desc_t *desc)
-{
+bool platform_usart_cdc_rx_async(platform_usart_rx_async_desc_t *desc){
 	return usart_rx_async(&ctx_uart, desc);
 }
-bool platform_usart_cdc_rx_busy(void)
-{
+
+bool platform_usart_cdc_rx_busy(void){
 	return usart_rx_busy(&ctx_uart);
 }
-void platform_usart_cdc_rx_abort(void)
-{
+
+void platform_usart_cdc_rx_abort(void){
 	usart_rx_abort_helper(&ctx_uart);
 }
 
+// API-visible items for GPS
+bool platform_usart_gps_rx_async(platform_usart_rx_async_desc_t *desc){
+	return usart_rx_async(&ctx_uart_gps, desc);
+}
 
+bool platform_usart_gps_rx_busy(void){
+	return usart_rx_busy(&ctx_uart_gps);
+}
 
+void platform_usart_gps_rx_abort(void){
+	usart_rx_abort_helper(&ctx_uart_gps);
+}
 
+// API-visible items for PM
+bool platform_usart_pm_rx_async(platform_usart_rx_async_desc_t *desc){
+	return usart_rx_async(&ctx_uart_pm, desc);
+}
 
+bool platform_usart_pm_rx_busy(void){
+	return usart_rx_busy(&ctx_uart_pm);
+}
 
-
-
-
-
-
-
-
-
-
+void platform_usart_pm_rx_abort(void){
+	usart_rx_abort_helper(&ctx_uart_pm);
+}
 
