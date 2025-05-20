@@ -690,10 +690,20 @@ static void prog_loop_one(void) {
 
     // --- Combined Data Display Logic ---
     // Example: Display data every 1 second if both GPS and PM data are ready
-    if ((app_state.flags & PROG_FLAG_GPGLL_DATA_PARSED) && (app_state.flags & PROG_FLAG_PM_DATA_PARSED)) {
+    if (app_state.flags & PROG_FLAG_PM_DATA_PARSED) { // Trigger if PM data is ready
         if ((current_time_ms - app_state.last_display_timestamp) >= app_state.display_interval_ms) {
-            ui_display_combined_data(&app_state); // This function should handle the actual printing
-            app_state.flags &= ~(PROG_FLAG_GPGLL_DATA_PARSED | PROG_FLAG_PM_DATA_PARSED); // Clear flags
+            ui_display_combined_data(&app_state); // This function handles printing based on available data
+
+            // Clear the PM flag as it has been processed for display.
+            app_state.flags &= ~PROG_FLAG_PM_DATA_PARSED;
+
+            // If GPGLL data was also parsed and displayed, clear its flag too.
+            // ui_display_combined_data uses PROG_FLAG_GPGLL_DATA_PARSED to determine what to print for GPS.
+            // If it was set, it means the (potentially valid or "N/A") GPS data was included in the display.
+            if (app_state.flags & PROG_FLAG_GPGLL_DATA_PARSED) {
+                 app_state.flags &= ~PROG_FLAG_GPGLL_DATA_PARSED;
+            }
+            
             app_state.last_display_timestamp = current_time_ms;
         }
     }
