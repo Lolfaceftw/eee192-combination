@@ -1272,7 +1272,7 @@ void ui_display_combined_data(prog_state_t *ps) {
     char temp_format_buf[CDC_TX_BUF_SZ]; 
 
     snprintf(temp_format_buf, sizeof(temp_format_buf),
-             "%sGPS: %s%s | %sPM: PM1.0: %u, PM2.5: %u, PM10: %u%s",
+             "%sGPS (NEO6M) => %s%s | %sPM (PMS7003) => PM1.0: %u ug/m3 | PM2.5: %u ug/m3 | PM10: %u ug/m3%s",
              ANSI_MAGENTA, 
              ps->formatted_gpggl_string, // Always use this string for the GPS part
              ANSI_RESET, 
