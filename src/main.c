@@ -283,7 +283,9 @@ static void process_accumulated_pm_data(struct prog_state_type *ps) {
 static void prog_setup(void) {
     // Initialize the program state structure
     memset(&app_state, 0, sizeof(prog_state_t));
-
+    snprintf(app_state.formatted_gpggl_string, 
+             sizeof(app_state.formatted_gpggl_string), 
+             "--:--:-- | Lat: Waiting for data..., - | Long: Waiting for data..., -");
     // Initialize hardware platform (clocks, GPIOs, SysTick, USARTs via platform_init)
     platform_init(); // This now inits SERCOM0, SERCOM1, and SERCOM3
     
@@ -766,6 +768,10 @@ int main(void) {
     return 0; // Should not reach here
 }
 
+// File: src/main.c
+// Function: ui_display_combined_data
+// Showing the modification to the provided block:
+
 void ui_display_combined_data(prog_state_t *ps) {
     // Ensure UART is free before attempting to print a new set of data
     uint32_t entry_wait_timeout = UART_WAIT_TIMEOUT_COUNT; // Timeout for waiting
@@ -779,32 +785,25 @@ void ui_display_combined_data(prog_state_t *ps) {
     
     char temp_format_buf[CDC_TX_BUF_SZ]; 
 
-    if (ps->flags & PROG_FLAG_GPGLL_DATA_PARSED && ps->formatted_gpggl_string[0] != '\0') {
-        snprintf(temp_format_buf, sizeof(temp_format_buf),
-                 "%sGPS: %s%s | %sPM: PM1.0: %u, PM2.5: %u, PM10: %u%s",
-                 ANSI_MAGENTA, 
-                 ps->formatted_gpggl_string, 
-                 ANSI_RESET, 
-                 ANSI_YELLOW,  
-                 ps->latest_pms_data.pm1_0_atm, 
-                 ps->latest_pms_data.pm2_5_atm, 
-                 ps->latest_pms_data.pm10_atm,
-                 ANSI_RESET); 
-    } else {
-        snprintf(temp_format_buf, sizeof(temp_format_buf),
-                 "%sGPS: Data N/A%s | %sPM: PM1.0: %u, PM2.5: %u, PM10: %u%s",
-                 ANSI_MAGENTA, 
-                 ANSI_RESET, 
-                 ANSI_YELLOW,  
-                 ps->latest_pms_data.pm1_0_atm, 
-                 ps->latest_pms_data.pm2_5_atm, 
-                 ps->latest_pms_data.pm10_atm,
-                 ANSI_RESET); 
-    }
+    // MODIFICATION START:
+    // The if/else block is removed.
+    // We now always use ps->formatted_gpggl_string.
+    // Its content is managed by nmea_parse_gpgll_and_format and initialized in prog_setup.
+    snprintf(temp_format_buf, sizeof(temp_format_buf),
+             "%sGPS: %s%s | %sPM: PM1.0: %u, PM2.5: %u, PM10: %u%s",
+             ANSI_MAGENTA, 
+             ps->formatted_gpggl_string, // Always use this string for the GPS part
+             ANSI_RESET, 
+             ANSI_YELLOW,  
+             ps->latest_pms_data.pm1_0_atm, 
+             ps->latest_pms_data.pm2_5_atm, 
+             ps->latest_pms_data.pm10_atm,
+             ANSI_RESET); 
+    // MODIFICATION END
 
     debug_printf(ps, "%s", temp_format_buf);
 
     // Flag clearing is handled by the caller in prog_loop_one
     // The line `ps->flags &= ~(PROG_FLAG_GPGLL_DATA_PARSED | PROG_FLAG_PM_DATA_PARSED);`
-    // was removed from here as per previous changes.md, and is handled in prog_loop_one.
+    // was correctly removed from here in previous steps, and is handled in prog_loop_one.
 }
