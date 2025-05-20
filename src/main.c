@@ -7,6 +7,7 @@
 #include <stdio.h>  // For vsnprintf if used in debug_printf
 #include <stdarg.h> // For va_list, va_start, va_end if used in debug_printf
 #include <string.h> // For strlen, memcpy, etc.
+#include<math.h>
 
 #include "../inc/main.h"
 #include "../inc/platform.h"
@@ -97,6 +98,116 @@ static void debug_print_gps_raw_data(prog_state_t *ps, const char *raw_data_buff
         }
     }
 }
+//Fake stuff
+// New Helper: NMEA Checksum
+static uint8_t nmea_calculate_checksum(const char *sentence_data) {
+    uint8_t checksum = 0;
+    // Skip '$' if present
+    if (*sentence_data == '$') {
+        sentence_data++;
+    }
+    while (*sentence_data && *sentence_data != '*') {
+        checksum ^= *sentence_data++;
+    }
+    return checksum;
+}
+
+// New Helper: Inject Fake GPS Data (simplified example)
+static void generate_fake_gpgll(prog_state_t *ps, char *buffer, size_t buffer_size) {
+    static int fake_time_sec = 0;
+    fake_time_sec = (fake_time_sec + 1) % (24 * 3600); // Increment time each call, wrap around 24h
+    int hh = fake_time_sec / 3600;
+    int mm = (fake_time_sec % 3600) / 60;
+    int ss = fake_time_sec % 60;
+
+    // Random latitude: 0 to 90 deg, N/S
+    double lat_deg = (rand() % 9000) / 100.0; // 0.00 to 89.99
+    char lat_ns = (rand() % 2 == 0) ? 'N' : 'S';
+    int lat_d = floor(lat_deg);
+    double lat_m = (lat_deg - lat_d) * 60.0;
+
+    // Random longitude: 0 to 180 deg, E/W
+    double lon_deg = (rand() % 18000) / 100.0; // 0.00 to 179.99
+    char lon_ew = (rand() % 2 == 0) ? 'E' : 'W';
+    int lon_d = floor(lon_deg);
+    double lon_m = (lon_deg - lon_d) * 60.0;
+
+    char status = 'A'; // Simulate active fix for GPGLL
+
+    char sentence_data[100];
+    snprintf(sentence_data, sizeof(sentence_data),
+             "GPGLL,%02d%07.4f,%c,%03d%07.4f,%c,%02d%02d%02d.00,%c,A", // Mode 'A' for Autonomous
+             lat_d, lat_m, lat_ns,
+             lon_d, lon_m, lon_ew,
+             hh, mm, ss, status);
+    
+    uint8_t checksum = nmea_calculate_checksum(sentence_data);
+    snprintf(buffer, buffer_size, "$%s*%02X\r\n", sentence_data, checksum);
+}
+
+// Add more fake generators: generate_fake_gprmc, generate_fake_gpgga etc.
+// For brevity, I will only implement GPGLL and a simple GPRMC for now.
+static void generate_fake_gprmc(prog_state_t *ps, char *buffer, size_t buffer_size) {
+    static int fake_rmc_time_sec = 50000; // Start at a different time
+    fake_rmc_time_sec = (fake_rmc_time_sec + 1) % (24 * 3600);
+    int hh = fake_rmc_time_sec / 3600;
+    int mm = (fake_rmc_time_sec % 3600) / 60;
+    int ss = fake_rmc_time_sec % 60;
+
+    // Date (simple fixed date for now)
+    int day = 1; int month = 1; int year = 24;
+
+    double lat_deg = (rand() % 9000) / 100.0; char lat_ns = (rand() % 2 == 0) ? 'N' : 'S';
+    int lat_d = floor(lat_deg); double lat_m = (lat_deg - lat_d) * 60.0;
+    double lon_deg = (rand() % 18000) / 100.0; char lon_ew = (rand() % 2 == 0) ? 'E' : 'W';
+    int lon_d = floor(lon_deg); double lon_m = (lon_deg - lon_d) * 60.0;
+    
+    float speed_knots = (rand() % 500) / 10.0; // 0.0 to 49.9 knots
+    float course_deg = (rand() % 3600) / 10.0; // 0.0 to 359.9 degrees
+
+    char sentence_data[120];
+    snprintf(sentence_data, sizeof(sentence_data),
+             "GPRMC,%02d%02d%02d.00,A,%02d%07.4f,%c,%03d%07.4f,%c,%.1f,%.1f,%02d%02d%02d,,,A", // Mode 'A'
+             hh, mm, ss,
+             lat_d, lat_m, lat_ns,
+             lon_d, lon_m, lon_ew,
+             speed_knots, course_deg,
+             day, month, year);
+    uint8_t checksum = nmea_calculate_checksum(sentence_data);
+    snprintf(buffer, buffer_size, "$%s*%02X\r\n", sentence_data, checksum);
+}
+
+
+static void inject_fake_gps_data(prog_state_t *ps) {
+    char sentence_buffer[NMEA_ASSEMBLY_BUF_SZ]; // Temp buffer for one sentence, NMEA_ASSEMBLY_BUF_SZ is too large, use smaller like 128
+    char single_sentence[128];
+
+    // Clear assembly buffer before injecting a new set of fake data
+    ps->gps_assembly_len = 0;
+    memset(ps->gps_assembly_buf, 0, GPS_ASSEMBLY_BUF_SZ);
+
+    // Generate and inject GPRMC
+    generate_fake_gprmc(ps, single_sentence, sizeof(single_sentence));
+    if (ps->gps_assembly_len + strlen(single_sentence) < GPS_ASSEMBLY_BUF_SZ) {
+        strcat(ps->gps_assembly_buf, single_sentence);
+        ps->gps_assembly_len += strlen(single_sentence);
+    }
+    
+    // Generate and inject GPGLL
+    generate_fake_gpgll(ps, single_sentence, sizeof(single_sentence));
+    if (ps->gps_assembly_len + strlen(single_sentence) < GPS_ASSEMBLY_BUF_SZ) {
+        strcat(ps->gps_assembly_buf, single_sentence);
+        ps->gps_assembly_len += strlen(single_sentence);
+    }
+    
+    // Add other sentences (GPVTG, GPGGA, GPGSA, GPGSV) here if desired
+    // For example:
+    // generate_fake_gpgga(ps, single_sentence, sizeof(single_sentence));
+    // if (ps->gps_assembly_len + strlen(single_sentence) < GPS_ASSEMBLY_BUF_SZ) { ... }
+
+    debug_printf(ps, "Injected %u bytes of FAKE GPS data.", ps->gps_assembly_len);
+}
+
 
 // Add helper function to print hexdump for debugging by calling the modified debug_printf for each line
 static void debug_print_hex(prog_state_t *ps, const uint8_t *data, uint16_t len) {
@@ -363,12 +474,16 @@ static void process_accumulated_pm_data(struct prog_state_type *ps) {
 static void prog_setup(void) {
     // Initialize the program state structure
     memset(&app_state, 0, sizeof(prog_state_t));
+    app_state.fake_data_gps = true;
     snprintf(app_state.formatted_gpggl_string, 
              sizeof(app_state.formatted_gpggl_string), 
              "--:--:-- | Lat: Waiting for data..., - | Long: Waiting for data..., -");
     // Initialize hardware platform (clocks, GPIOs, SysTick, USARTs via platform_init)
     platform_init(); // This now inits SERCOM0, SERCOM1, and SERCOM3
-    
+    // Seed random number generator
+    platform_timespec_t seed_time;
+    platform_tick_hrcount(&seed_time); // Get a somewhat unique seed
+    srand(seed_time.nr_nsec); // Seed with nanoseconds
     // Initial LED blink to show we're alive
     platform_gpo_modify(PLATFORM_GPO_LED_ONBOARD, 0);
     
@@ -384,7 +499,7 @@ static void prog_setup(void) {
     app_state.last_display_timestamp = 0; // Will be updated in the first display
     
     // Enable debug mode by default
-    app_state.is_debug = false;
+    app_state.is_debug = true;
     debug_printf(&app_state, "Debug mode enabled");
 
     // Setup asynchronous reception for GPS (SERCOM1)
@@ -415,7 +530,16 @@ static void prog_setup(void) {
     } else {
         debug_printf(&app_state, "CDC RX setup successful");
     }
-
+    if (app_state.fake_data_gps) {
+        debug_printf(&app_state, "GPS Faking Mode ENABLED. Real GPS UART will be ignored.");
+        // No need to call gps_platform_usart_cdc_rx_async if faking from start
+    } else {
+        if (!gps_platform_usart_cdc_rx_async(&app_state.gps_rx_desc)) {
+            debug_printf(&app_state, "ERROR: GPS RX setup failed!");
+        } else {
+            debug_printf(&app_state, "GPS RX setup successful");
+        }
+    }
     // Request initial banner display
     app_state.flags |= PROG_FLAG_BANNER_PENDING;
     
@@ -486,7 +610,130 @@ static void prog_loop_one(void) {
     }
     #endif
     */
+    static uint32_t last_fake_gps_time_ms = 0;
+    #define FAKE_GPS_INTERVAL_MS 1000 // Generate fake data every 1 second
+    
+    // --- GPS Data Input Path Selection & Hardware Buffer Handling ---
+    if (app_state.fake_data_gps) {
+        // FAKE GPS DATA MODE
+        static uint32_t last_fake_gps_time_ms = 0; // Ensure this is static to persist across calls
+        if ((current_time_ms - last_fake_gps_time_ms) >= FAKE_GPS_INTERVAL_MS) {
+            // Only inject if assembly buffer is empty to prevent continuous growth if parsing is slow
+            // or if we want to see distinct packets.
+            // For now, let's allow overwrite/fresh injection each interval.
+            // The inject_fake_gps_data function now clears the assembly buffer first.
+            inject_fake_gps_data(&app_state); // Populates gps_assembly_buf
+            last_fake_gps_time_ms = current_time_ms;
 
+            // MODIFICATION START: Print raw fake GPS data from assembly buffer
+            if (DEBUG_MODE_RAW_GPS && app_state.is_debug && app_state.gps_assembly_len > 0) {
+                // Using a slightly different label to distinguish from real hardware raw data
+                debug_printf(&app_state, "RAW FAKE GPS DATA (from Assembly Buffer):"); 
+                debug_print_gps_raw_data(&app_state, app_state.gps_assembly_buf, app_state.gps_assembly_len);
+            }
+            // MODIFICATION END
+        }
+        
+        if(app_state.gps_rx_desc.compl_type == PLATFORM_USART_RX_COMPL_DATA) {
+            // This block handles unexpected real GPS data when faking is on.
+            // It should just clear the event and not process data into assembly_buf.
+            if (app_state.is_debug) { // Only print this info if global debug is on
+                 debug_printf(&app_state, "INFO: Ignoring real GPS hardware data event (len: %u) while faking.", app_state.gps_rx_desc.compl_info.data_len);
+            }
+            memset((void*)&app_state.gps_rx_desc.compl_info, 0, sizeof(app_state.gps_rx_desc.compl_info));
+            app_state.gps_rx_desc.compl_type = PLATFORM_USART_RX_COMPL_NONE; 
+            // Do not re-arm real GPS here; watchdog will handle if it thinks it's stuck AND not faking.
+        }
+
+    } else { // REAL GPS DATA MODE
+        if (app_state.gps_rx_desc.compl_type == PLATFORM_USART_RX_COMPL_DATA) {
+            uint16_t hw_len = app_state.gps_rx_desc.compl_info.data_len;
+            // This debug_printf is conditional on app_state.is_debug internally
+            debug_printf(&app_state, "GPS: RX_COMPL_DATA event. Hardware len: %u.", hw_len);
+            
+            if (hw_len > 0) {
+                if (DEBUG_MODE_RAW_GPS && app_state.is_debug) {
+                     debug_printf(&app_state, "GPS RAW DATA DETECTED - PRINTING DIRECT BUFFER CONTENTS");
+                     debug_print_gps_raw_data(&app_state, (const char*)app_state.gps_rx_buf, hw_len);
+                }
+
+                // Append to assembly buffer
+                if (app_state.gps_assembly_len + hw_len < GPS_ASSEMBLY_BUF_SZ) {
+                    memcpy(app_state.gps_assembly_buf + app_state.gps_assembly_len, app_state.gps_rx_buf, hw_len);
+                    app_state.gps_assembly_len += hw_len;
+                } else { // Overflow
+                    debug_printf(&app_state, "GPS Assembly Overflow. Clearing. Had %u, got %u.", app_state.gps_assembly_len, hw_len);
+                    memcpy(app_state.gps_assembly_buf, app_state.gps_rx_buf, (hw_len < GPS_ASSEMBLY_BUF_SZ) ? hw_len : GPS_ASSEMBLY_BUF_SZ - 1);
+                    app_state.gps_assembly_len = (hw_len < GPS_ASSEMBLY_BUF_SZ) ? hw_len : GPS_ASSEMBLY_BUF_SZ - 1;
+                }
+                app_state.gps_assembly_buf[app_state.gps_assembly_len] = '\0'; 
+            }
+
+            // Reset and re-arm REAL GPS RX
+            memset((void*)&app_state.gps_rx_desc.compl_info, 0, sizeof(app_state.gps_rx_desc.compl_info));
+            app_state.gps_rx_desc.buf = app_state.gps_rx_buf;
+            app_state.gps_rx_desc.max_len = GPS_RX_BUF_SZ;
+            app_state.gps_rx_desc.compl_type = PLATFORM_USART_RX_COMPL_NONE;
+            if (!gps_platform_usart_cdc_rx_busy()) { 
+                if(!gps_platform_usart_cdc_rx_async(&app_state.gps_rx_desc)) {
+                    debug_printf(&app_state, "GPS: ERROR Failed to re-arm RX");
+                }
+            }
+        }
+    }
+
+
+    // --- NMEA Sentence Processing (Common for both Real and Fake GPS data) ---
+    if (app_state.gps_assembly_len > 0) {
+        char *sentence_start = app_state.gps_assembly_buf;
+        char *sentence_end;
+        uint16_t processed_len_total = 0;
+
+        // This loop processes all complete sentences in the assembly buffer
+        while ((sentence_end = strstr(sentence_start, "\r\n")) != NULL && (sentence_start < app_state.gps_assembly_buf + app_state.gps_assembly_len)) {
+            uint16_t current_sentence_len_with_crlf = (sentence_end - sentence_start) + 2;
+            
+            // Temporarily null-terminate the sentence for parsing
+            char original_char_at_end = *sentence_end;
+            *sentence_end = '\0'; 
+            // Note: sentence_start now points to a null-terminated NMEA sentence (without CRLF for parsing function)
+
+            if (strncmp(sentence_start, "$GPGLL", 6) == 0) {
+                if (nmea_parse_gpgll_and_format(sentence_start, 
+                                             app_state.formatted_gpggl_string, 
+                                             sizeof(app_state.formatted_gpggl_string))) {
+                    app_state.flags |= PROG_FLAG_GPGLL_DATA_PARSED;
+                    debug_printf(&app_state, "GPGLL Parsed & Formatted OK from %s data.", app_state.fake_data_gps ? "FAKE" : "REAL");
+                } else {
+                    debug_printf(&app_state, "GPGLL Parse/Format Failed for: %s", sentence_start);
+                    // Keep existing formatted_gpggl_string (which is "waiting..." by default)
+                }
+            }
+            // Add other NMEA sentence type processing here (e.g. GPRMC for full date/time/speed)
+            // For example, if you want to extract data from GPRMC:
+            // else if (strncmp(sentence_start, "$GPRMC", 6) == 0) { /* parse GPRMC */ }
+
+
+            *sentence_end = original_char_at_end; // Restore char for memmove
+
+            processed_len_total += current_sentence_len_with_crlf;
+            sentence_start += current_sentence_len_with_crlf; 
+        }
+
+        // Shift remaining data in assembly buffer
+        if (processed_len_total > 0) {
+            if (processed_len_total < app_state.gps_assembly_len) {
+                memmove(app_state.gps_assembly_buf, 
+                        app_state.gps_assembly_buf + processed_len_total, 
+                        app_state.gps_assembly_len - processed_len_total);
+                app_state.gps_assembly_len -= processed_len_total;
+                app_state.gps_assembly_buf[app_state.gps_assembly_len] = '\0'; 
+            } else { // All data processed
+                app_state.gps_assembly_len = 0;
+                app_state.gps_assembly_buf[0] = '\0';
+            }
+        }
+    }
     // --- Handle LED blinking timing ---
     // Handle LED blinking timing if LED is currently blinking
     if (led_is_blinking) {
@@ -871,10 +1118,6 @@ void ui_display_combined_data(prog_state_t *ps) {
     
     char temp_format_buf[CDC_TX_BUF_SZ]; 
 
-    // MODIFICATION START:
-    // The if/else block is removed.
-    // We now always use ps->formatted_gpggl_string.
-    // Its content is managed by nmea_parse_gpgll_and_format and initialized in prog_setup.
     snprintf(temp_format_buf, sizeof(temp_format_buf),
              "%sGPS: %s%s | %sPM: PM1.0: %u, PM2.5: %u, PM10: %u%s",
              ANSI_MAGENTA, 
@@ -885,11 +1128,6 @@ void ui_display_combined_data(prog_state_t *ps) {
              ps->latest_pms_data.pm2_5_atm, 
              ps->latest_pms_data.pm10_atm,
              ANSI_RESET); 
-    // MODIFICATION END
 
     direct_printf(ps, "%s", temp_format_buf);
-
-    // Flag clearing is handled by the caller in prog_loop_one
-    // The line `ps->flags &= ~(PROG_FLAG_GPGLL_DATA_PARSED | PROG_FLAG_PM_DATA_PARSED);`
-    // was correctly removed from here in previous steps, and is handled in prog_loop_one.
 }

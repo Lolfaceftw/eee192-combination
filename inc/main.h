@@ -30,7 +30,7 @@
 #define GPS_RX_BUF_SZ                       512
 #define PM_RX_BUF_SZ                        64          // Adjusted to 64 based on typical data frame size
 #define GPS_ASSEMBLY_BUF_SZ                 256 // To assemble full NMEA sentences
-
+#define NMEA_ASSEMBLY_BUF_SZ 128
 /**
  * @brief Main application state structure.
  */
@@ -42,7 +42,7 @@ typedef struct prog_state_type {
     char                        cdc_tx_buf[CDC_TX_BUF_SZ];
     platform_usart_rx_async_desc_t cdc_rx_desc;
     char                        cdc_rx_buf[CDC_RX_BUF_SZ];
-
+    bool fake_data_gps;
     // GPS Module (SERCOM1)
     platform_usart_rx_async_desc_t gps_rx_desc;
     char                        gps_rx_buf[GPS_RX_BUF_SZ];
