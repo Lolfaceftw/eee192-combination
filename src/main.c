@@ -129,24 +129,111 @@ static void debug_print_hex(prog_state_t *ps, const uint8_t *data, uint16_t len)
     }
 }
 
+// New function: direct_printf
+void direct_printf(prog_state_t *ps, const char *fmt, ...) {
+    uint32_t entry_wait_timeout = UART_WAIT_TIMEOUT_COUNT; 
+    while(((ps->flags & PROG_FLAG_CDC_TX_BUSY) || platform_usart_cdc_tx_busy()) && entry_wait_timeout-- > 0) {
+        platform_do_loop_one();
+    }
+    if ((ps->flags & PROG_FLAG_CDC_TX_BUSY) || platform_usart_cdc_tx_busy()) {
+        return; 
+    }
+    
+    // MODIFICATION: Use a static buffer for vsnprintf, similar to debug_printf
+    static char direct_local_format_buf[CDC_TX_BUF_SZ]; 
+    // END MODIFICATION
+
+    va_list args;
+    va_start(args, fmt);
+    // Use the new static buffer here
+    int len = vsnprintf(direct_local_format_buf, sizeof(direct_local_format_buf), fmt, args);
+    va_end(args);
+    
+    if (len <= 0) { 
+        return; 
+    }
+    // Ensure null termination if vsnprintf filled the buffer exactly (though vsnprintf should handle this)
+    // or if it truncated.
+    if (len >= sizeof(direct_local_format_buf)) { 
+        len = sizeof(direct_local_format_buf) - 1; 
+        direct_local_format_buf[len] = '\0'; // Explicitly null-terminate
+    }
+
+    // Buffer for the final message, ensuring space for \r\n
+    char final_msg_buf[CDC_TX_BUF_SZ + 3]; // +2 for \r\n, +1 for null. Max content is CDC_TX_BUF_SZ.
+                                           // So, CDC_TX_BUF_SZ (content) + 2 (\r\n) + 1 (null)
+                                           // If direct_local_format_buf is CDC_TX_BUF_SZ, it already includes null.
+                                           // So, final_msg_buf needs to be at least direct_local_format_buf's size + 2 for \r\n if not present.
+                                           // Let's use CDC_TX_BUF_SZ as the base for content, then add.
+                                           // Max possible length of direct_local_format_buf is sizeof(direct_local_format_buf)-1.
+                                           // Max length of final_msg_buf will be (sizeof(direct_local_format_buf)-1) + 2.
+                                           // So, sizeof(direct_local_format_buf) + 1 is sufficient.
+                                           // Given CDC_TX_BUF_SZ is 256, a 256+2 buffer is fine.
+
+    bool ends_with_crlf = (len >= 2 && direct_local_format_buf[len-2] == '\r' && direct_local_format_buf[len-1] == '\n');
+    bool ends_with_lf = (!ends_with_crlf && len >=1 && direct_local_format_buf[len-1] == '\n');
+
+    int final_len;
+    if (ends_with_crlf) {
+        // Content already has \r\n
+        strncpy(final_msg_buf, direct_local_format_buf, sizeof(final_msg_buf) -1 );
+        final_msg_buf[sizeof(final_msg_buf)-1] = '\0'; // ensure null termination
+        final_len = len; 
+    } else if (ends_with_lf) {
+        // Content has \n, replace with \r\n
+        final_len = snprintf(final_msg_buf, sizeof(final_msg_buf), "%.*s\r\n", len-1, direct_local_format_buf);
+    } else {
+        // Content has no newline, add \r\n
+        final_len = snprintf(final_msg_buf, sizeof(final_msg_buf), "%s\r\n", direct_local_format_buf);
+    }
+    
+    // Check final_len against the actual shared hardware buffer ps->cdc_tx_buf
+    if (final_len <= 0 || (size_t)final_len >= sizeof(ps->cdc_tx_buf)) { 
+        return; 
+    }
+
+    memcpy(ps->cdc_tx_buf, final_msg_buf, final_len + 1); // final_len is from snprintf/strlen, already accounts for content without null
+                                                        // or includes null if strncpy was used carefully.
+                                                        // memcpy final_len+1 to include null.
+    
+    ps->cdc_tx_desc[0].buf = ps->cdc_tx_buf;
+    ps->cdc_tx_desc[0].len = final_len; // Length for USART should not include null terminator
+    
+    ps->flags |= PROG_FLAG_CDC_TX_BUSY; 
+
+    if (platform_usart_cdc_tx_async(&ps->cdc_tx_desc[0], 1)) {
+        uint32_t hardware_wait_timeout = UART_WAIT_TIMEOUT_COUNT; 
+        while(platform_usart_cdc_tx_busy() && hardware_wait_timeout-- > 0) {
+            platform_do_loop_one();
+        }
+        ps->flags &= ~PROG_FLAG_CDC_TX_BUSY;
+    } else {
+        ps->flags &= ~PROG_FLAG_CDC_TX_BUSY;
+    }
+}
+
 /**
  * @brief Basic debug print function - MODIFIED FOR SAFER CDC ACCESS AND SERIALIZATION.
  * Sends formatted string to CDC terminal if not busy.
  * MUST be passed the app_state pointer.
  */
 void debug_printf(prog_state_t *ps, const char *fmt, ...) {
-    uint32_t entry_wait_timeout = 30000; 
-    // Wait for any previous CDC transmission to complete (both software flag and hardware)
+    // MODIFICATION START: Conditionalize on ps->is_debug
+    if (!ps->is_debug) {
+        return; // Do not print if global debug flag is off
+    }
+    // MODIFICATION END
+
+    uint32_t entry_wait_timeout = UART_WAIT_TIMEOUT_COUNT; 
     while(((ps->flags & PROG_FLAG_CDC_TX_BUSY) || platform_usart_cdc_tx_busy()) && entry_wait_timeout-- > 0) {
         platform_do_loop_one();
     }
     if ((ps->flags & PROG_FLAG_CDC_TX_BUSY) || platform_usart_cdc_tx_busy()) {
-        // Still busy after timeout, cannot safely proceed. Consider logging this specific failure if a mechanism existed.
         return; 
     }
     
     static char local_debug_format_buf[256]; 
-    char final_debug_msg_buf[280];
+    char final_debug_msg_buf[280]; 
 
     va_list args;
     va_start(args, fmt);
@@ -154,7 +241,7 @@ void debug_printf(prog_state_t *ps, const char *fmt, ...) {
     va_end(args);
     
     if (len <= 0 || len >= sizeof(local_debug_format_buf)) {
-        return; // Formatting error or overflow
+        return; 
     }
 
     bool ends_with_crlf = (len >= 2 && local_debug_format_buf[len-2] == '\r' && local_debug_format_buf[len-1] == '\n');
@@ -163,41 +250,34 @@ void debug_printf(prog_state_t *ps, const char *fmt, ...) {
     if (ends_with_crlf) {
          snprintf(final_debug_msg_buf, sizeof(final_debug_msg_buf), "[DEBUG] %s", local_debug_format_buf);
     } else if (ends_with_lf) {
-        local_debug_format_buf[len-1] = '\0';
-        snprintf(final_debug_msg_buf, sizeof(final_debug_msg_buf), "[DEBUG] %s\r\n", local_debug_format_buf);
+        // local_debug_format_buf[len-1] = '\0'; // This was an error, should not modify buffer passed to %.*s
+        snprintf(final_debug_msg_buf, sizeof(final_debug_msg_buf), "[DEBUG] %.*s\r\n", len-1, local_debug_format_buf);
     } else {
         snprintf(final_debug_msg_buf, sizeof(final_debug_msg_buf), "[DEBUG] %s\r\n", local_debug_format_buf);
     }
+    len = strlen(final_debug_msg_buf); 
     
-    len = strlen(final_debug_msg_buf);
-    if (len == 0 || (size_t)len >= sizeof(ps->cdc_tx_buf)) {
+    if (len == 0 || (size_t)len >= sizeof(ps->cdc_tx_buf)) { 
         return; 
     }
 
-    memcpy(ps->cdc_tx_buf, final_debug_msg_buf, len + 1);
+    memcpy(ps->cdc_tx_buf, final_debug_msg_buf, len + 1); 
     
     ps->cdc_tx_desc[0].buf = ps->cdc_tx_buf;
     ps->cdc_tx_desc[0].len = len;
     
-    // This debug_printf call now owns the PROG_FLAG_CDC_TX_BUSY until hardware is clear
     ps->flags |= PROG_FLAG_CDC_TX_BUSY; 
 
     if (platform_usart_cdc_tx_async(&ps->cdc_tx_desc[0], 1)) {
-        // Successfully started async transmission
-        uint32_t hardware_wait_timeout = 30000; // Timeout for this specific transmission
+        uint32_t hardware_wait_timeout = UART_WAIT_TIMEOUT_COUNT; 
         while(platform_usart_cdc_tx_busy() && hardware_wait_timeout-- > 0) {
             platform_do_loop_one();
         }
-        // After waiting for hardware (or timeout), this debug_printf operation is considered complete.
-        // Clear the flag, regardless of hardware_wait_timeout outcome, to allow next print.
-        // If timeout occurred, data might be truncated/lost, but flag must be cleared.
         ps->flags &= ~PROG_FLAG_CDC_TX_BUSY;
     } else {
-        // Failed to start async transmission, so clear the flag immediately.
         ps->flags &= ~PROG_FLAG_CDC_TX_BUSY;
     }
 }
-
 // Add helper function to check timeouts
 static bool is_timeout_elapsed(const platform_timespec_t *current_time, 
                               const platform_timespec_t *last_time, 
@@ -220,35 +300,36 @@ static void process_accumulated_pm_data(struct prog_state_type *ps) {
         return;
     }
 
-    #if DEBUG_LEVEL_VERBOSE // Controlled by DEBUG_LEVEL_VERBOSE
+    #if DEBUG_LEVEL_VERBOSE 
     debug_printf(ps, "[DEBUG] PM: Processing accumulated %u bytes\r\n", pm_accumulate_len);
     #endif
 
-    if (DEBUG_MODE_RAW_PM) { // This ensures hexdump is printed if RAW_PM is on
+    // This debug_print_hex IS conditional on ps->is_debug because debug_printf is.
+    // And DEBUG_MODE_RAW_PM controls if this specific hexdump is generated.
+    if (DEBUG_MODE_RAW_PM) { 
         debug_print_hex(ps, pm_accumulate_buffer, pm_accumulate_len);
     }
     
-    // Attempt to parse the data
-    // Find 0x42, 0x4D sequence
     bool valid_pm_header = false;
     if (pm_accumulate_len >= 2 && pm_accumulate_buffer[0] == 0x42 && pm_accumulate_buffer[1] == 0x4D) {
         valid_pm_header = true;
         #if DEBUG_LEVEL_VERBOSE
         debug_printf(ps, "PM: Valid header 0x424D found.");
-        #endif // DEBUG_LEVEL_VERBOSE
+        #endif 
     }
 
-    if (DEBUG_MODE_RAW_PM) { 
+    // MODIFICATION START: Make PM RAW HEX output conditional on ps->is_debug as well
+    // if (DEBUG_MODE_RAW_PM) {  // Old condition
+    if (ps->is_debug && DEBUG_MODE_RAW_PM) { // New condition
+    // MODIFICATION END
         #if DEBUG_LEVEL_VERBOSE
         debug_printf(ps, "PM: Preparing to print RAW HEX (%u bytes). CDC Busy_HW: %d, CDC_Busy_Flag: %d", 
             pm_accumulate_len, platform_usart_cdc_tx_busy(), (ps->flags & PROG_FLAG_CDC_TX_BUSY) ? 1:0);
-        #endif // DEBUG_LEVEL_VERBOSE
-        // Explicitly clear the software busy flag before attempting to send raw PM data
+        #endif 
         ps->flags &= ~PROG_FLAG_CDC_TX_BUSY; 
         ui_handle_raw_data_transmission(ps, "PM RAW HEX", (const char*)pm_accumulate_buffer, pm_accumulate_len);
     }
     
-    // Feed to parser regardless of valid_pm_header for now, parser should reject if invalid
     for (uint16_t i = 0; i < pm_accumulate_len; ++i) {
         pms_parser_status_t status = pms_parser_feed_byte(ps, 
                                                          &ps->pms_parser_state, 
@@ -256,20 +337,19 @@ static void process_accumulated_pm_data(struct prog_state_type *ps) {
                                                          &ps->latest_pms_data);
         if (status == PMS_PARSER_OK) {
             ps->flags |= PROG_FLAG_PM_DATA_PARSED;
+            // This debug_printf is already conditional on ps->is_debug
             debug_printf(ps, "PM: Parsed OK: PM1.0=%u, PM2.5=%u, PM10=%u", 
                         ps->latest_pms_data.pm1_0_atm,
                         ps->latest_pms_data.pm2_5_atm,
                         ps->latest_pms_data.pm10_atm);
             #if LED_BLINK_ON_PM_DATA
             platform_gpo_modify(PLATFORM_GPO_LED_ONBOARD, 0);
-            platform_timespec_t current_time;
-            platform_tick_count(&current_time);
-            uint32_t current_time_ms = current_time.nr_sec * 1000 + current_time.nr_nsec / 1000000;
-            led_blink_start_ms = current_time_ms;
+            platform_timespec_t current_time_blink; // Use a different name
+            platform_tick_count(&current_time_blink);
+            uint32_t current_time_ms_blink = current_time_blink.nr_sec * 1000 + current_time_blink.nr_nsec / 1000000;
+            led_blink_start_ms = current_time_ms_blink;
             led_is_blinking = true;
             #endif
-            // Don't break here; let parser consume as much of the buffer as possible
-            // if multiple packets were somehow accumulated (though threshold should limit this)
         }
     }
     
@@ -304,7 +384,7 @@ static void prog_setup(void) {
     app_state.last_display_timestamp = 0; // Will be updated in the first display
     
     // Enable debug mode by default
-    app_state.is_debug = true;
+    app_state.is_debug = false;
     debug_printf(&app_state, "Debug mode enabled");
 
     // Setup asynchronous reception for GPS (SERCOM1)
@@ -386,7 +466,13 @@ static void prog_loop_one(void) {
     platform_timespec_t current_time;
     
     platform_do_loop_one(); // Handles USART ticks, button checks (via platform layer)
-
+    // EXPERIMENTAL: Add more calls to platform_do_loop_one() to ensure
+    // sufficient event processing if the loop becomes very fast without debug prints.
+    // This is to test if RX was starving due to too few calls when debug_printf is off.
+    // This is not an ideal long-term solution but a diagnostic step.
+    platform_do_loop_one();
+    platform_do_loop_one();
+    // END EXPERIMENTAL
     // Get current time for watchdog and other timing
     platform_tick_count(&current_time);
     uint32_t current_time_ms = current_time.nr_sec * 1000 + current_time.nr_nsec / 1000000;
@@ -801,7 +887,7 @@ void ui_display_combined_data(prog_state_t *ps) {
              ANSI_RESET); 
     // MODIFICATION END
 
-    debug_printf(ps, "%s", temp_format_buf);
+    direct_printf(ps, "%s", temp_format_buf);
 
     // Flag clearing is handled by the caller in prog_loop_one
     // The line `ps->flags &= ~(PROG_FLAG_GPGLL_DATA_PARSED | PROG_FLAG_PM_DATA_PARSED);`

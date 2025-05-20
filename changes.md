@@ -262,3 +262,73 @@ what:
   - Restructured PM data handling in `prog_loop_one`: data is accumulated in `pm_accumulate_buffer` upon `PLATFORM_USART_RX_COMPL_DATA`. `pm_last_receive_time` is updated. `process_accumulated_pm_data` is now called if `pm_accumulate_len` reaches `PM_ACCUMULATE_THRESHOLD` OR if `PM_ACCUMULATE_TIMEOUT_MS` elapses with `pm_accumulate_len > 0`. The buffer is cleared after processing.
   - Corrected `debug_print_gps_raw_data`: changed `debug_printf(ps, "[DEBUG] GPS Raw Data:\r\n");` to `debug_printf(ps, "GPS Raw Data:");` as `debug_printf` already adds `[DEBUG]` and CRLF.
   - Modified `ui_display_combined_data`: changed the `debug_printf` format string to `"GPS: %s | PM: PM1.0: %u, PM2.5: %u, PM10: %u"` to remove the redundant `[GPS]` and `[PM]` prefixes from the *content* (as `debug_printf` adds `[DEBUG]`). Switched from `latest_pms_data.pmX_Y_std` to `latest_pms_data.pmX_Y_atm` for displaying PM values.
+
+---
+how: Increased the PM sensor USART (SERCOM0) reception idle timeout and corrected include path.
+where:
+  - File: `src/drivers/pm_usart.c`
+  - Function: `pm_platform_usart_init`
+  - Line: `pm_ctx_uart.cfg.ts_idle_timeout.nr_nsec` assignment and the `#include "platform.h"` line.
+why: The PM sensor data was being received in small, incomplete chunks (often just 1 byte, 0x42), causing the hexdump to be partial. This was due to a very short USART RX idle timeout (0.78125 ms) which is less than the transmission time of a single byte at 9600 baud. Increasing this timeout allows the driver to accumulate more bytes, ideally a full packet, before signaling reception completion. Also, the include path for `platform.h` was incorrect for its location.
+what:
+  - Changed `pm_ctx_uart.cfg.ts_idle_timeout.nr_nsec` from `781250` to `50000000` (50 milliseconds).
+  - Updated the comment for this line to reflect the new value and rationale.
+  - Corrected `#include "platform.h"` to `#include "../../inc/platform.h"`.
+  - Ensured PM sensor uses 1 stop bit (CTRLB.SBMODE=0) as per typical PMS5003 configuration.
+  - Verified PA05 (RX) pin multiplexing for SERCOM0_ALT.
+
+---
+how: Modified the condition for displaying combined GPS/PM data to trigger primarily on parsed PM data availability.
+where:
+  - File: `src/main.c`
+  - Function: `prog_loop_one`
+  - Specific location: The "Combined Data Display Logic" block (around line 517).
+why: To make the combined data line (e.g., `[DEBUG] GPS: ... | PM: ...`) print more consistently, especially when PM data is available but GPS data might still be "Waiting for data...". The previous condition required both GPS and PM data to be parsed, leading to infrequent updates if GPS had no fix.
+what:
+  - Changed the primary condition for calling `ui_display_combined_data` from `(app_state.flags & PROG_FLAG_GPGLL_DATA_PARSED) && (app_state.flags & PROG_FLAG_PM_DATA_PARSED)` to `(app_state.flags & PROG_FLAG_PM_DATA_PARSED)`.
+  - Adjusted the flag clearing logic within this block: `PROG_FLAG_PM_DATA_PARSED` is always cleared after display. `PROG_FLAG_GPGLL_DATA_PARSED` is also cleared if it was set (meaning its data, valid or "N/A", was incorporated into the display by `ui_display_combined_data`). This ensures the display updates whenever new PM data is parsed and the display interval has elapsed, showing the latest PM values alongside the current GPS status.
+
+---
+how: Added ANSI color escape codes to the combined GPS/PM data display string.
+where:
+  - File: `src/main.c` (function `ui_display_combined_data`)
+  - File: `inc/terminal_ui.h` (added extern declarations for new ANSI color constants)
+  - File: `src/terminal_ui.c` (added definitions for new ANSI color constants)
+why: To visually distinguish GPS data (violet) from PM data (gold/yellow) in the terminal output, as requested, and to centralize ANSI code definitions according to existing conventions.
+what:
+  - Added `extern const char ANSI_MAGENTA[];` and `extern const char ANSI_YELLOW[];` to `inc/terminal_ui.h`. Made `ANSI_RESET` extern as well.
+  - Defined `const char ANSI_MAGENTA[] = "\033[35m";`, `const char ANSI_YELLOW[] = "\033[33m";` in `src/terminal_ui.c` and made `ANSI_RESET` non-static.
+  - Removed local `#define`s for these colors from `src/main.c`.
+  - Modified the `snprintf` calls within `ui_display_combined_data` in `src/main.c` to use `ANSI_MAGENTA`, `ANSI_YELLOW`, and `ANSI_RESET` (now accessed via `terminal_ui.h`) to color the GPS and PM sections of the output string.
+
+---
+how: Replaced the body of the `ui_display_combined_data` function with the version developed in the immediately preceding step, which incorporates ANSI colorization for GPS (violet) and PM (gold/yellow) data, using constants defined in and made extern from `terminal_ui.c` and `terminal_ui.h`.
+where:
+  - File: `src/main.c`
+  - Function: `ui_display_combined_data` (entire body replaced).
+why: To implement the requested colorization of the combined GPS/PM output line, ensuring consistency with how other ANSI escape codes are managed in the project.
+what: The `ui_display_combined_data` function in `src/main.c` now uses `ANSI_MAGENTA`, `ANSI_YELLOW`, and `ANSI_RESET` (sourced from `terminal_ui.h`) to format the output string with colors for GPS and PM data segments before passing it to `debug_printf`. The flag clearing logic remains handled by the caller (`prog_loop_one`).
+
+---
+how: Standardized the display of GPS data in the combined output line to always show the "Time | Lat | Long" format, using placeholders when actual data is unavailable. This involved initializing the GPS data string and simplifying the display logic.
+where:
+  - File: `src/main.c`
+  - Function: `prog_setup()` (added initialization for `app_state.formatted_gpggl_string`)
+  - Function: `ui_display_combined_data()` (simplified to always use `app_state.formatted_gpggl_string`)
+why: To ensure the combined GPS/PM display line consistently shows the "GPS: Time | Lat | Long | PM: ..." structure, using "Waiting for data..." placeholders for GPS fields when a fix is not yet available, instead of sometimes showing "GPS: Data N/A".
+what:
+  - In `prog_setup()`, `app_state.formatted_gpggl_string` is now initialized with "--:--:-- | Lat: Waiting for data..., - | Long: Waiting for data..., -".
+  - In `ui_display_combined_data()`, the `if/else` logic that chose between `ps->formatted_gpggl_string` and "GPS: Data N/A" was removed. The function now always uses `ps->formatted_gpggl_string` for the GPS part of the output. The `nmea_parse_gpgll_and_format` function is responsible for populating this string correctly with either actual data or the "Waiting for data..." placeholders.
+
+---
+how: Created a new `direct_printf` function for printing messages without the `[DEBUG]` prefix and updated `ui_display_combined_data` to use it. The `direct_printf` was also refined to use a static buffer for `vsnprintf`, mirroring `debug_printf`.
+where:
+  - File: `src/main.c`
+  - New function: `direct_printf` (definition and forward declaration).
+  - Modified function: `direct_printf` (changed `local_format_buf` to `static direct_local_format_buf`, refined `final_len` and `final_msg_buf` handling).
+  - Modified function: `ui_display_combined_data` (changed call from `debug_printf` to `direct_printf`).
+why: To allow the main status line (combined GPS/PM data) to be printed without the `[DEBUG]` prefix, making it a clear status update. Using a static buffer in `direct_printf` for formatting aligns its memory usage pattern with `debug_printf` and avoids repeated large stack allocations.
+what:
+  - Implemented `direct_printf(prog_state_t *ps, const char *fmt, ...)` which formats a string (using a static internal buffer `static char direct_local_format_buf[CDC_TX_BUF_SZ];`) and sends it via CDC USART, ensuring `\r\n` line endings, but without adding `[DEBUG]`. It includes UART busy management similar to `debug_printf`.
+  - Corrected `final_msg_buf` size and `final_len` calculation within `direct_printf` to robustly handle string construction and `\r\n` appending.
+  - Changed the final print call in `ui_display_combined_data` from `debug_printf(ps, "%s", temp_format_buf);` to `direct_printf(ps, "%s", temp_format_buf);`.
